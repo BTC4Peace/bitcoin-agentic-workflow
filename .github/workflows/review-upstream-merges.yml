@@ -105,7 +105,7 @@ jobs:
 
               if {
                 printf 'Commit: %s\nTitle: %s\n\nDiff stat:\n%s\n\nDiff:\n' "$SHA" "$TITLE" "$DIFF_STAT"
-                git diff "${SHA}^1..${SHA}" | head -c "$MAX_DIFF_BYTES"
+                (set +o pipefail; git diff "${SHA}^1..${SHA}" | head -c "$MAX_DIFF_BYTES")
               } | gemini --approval-mode=plan -p "$REVIEW_PROMPT" > "$REVIEW_FILE"; then
                 if [ -s "$REVIEW_FILE" ]; then
                   gh pr comment "$PR_URL" \
