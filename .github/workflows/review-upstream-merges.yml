@@ -18,16 +18,30 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Gemini CLI
+        if: env.GEMINI_API_KEY != ''
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: npm install -g @google/gemini-cli
+
       - name: Fetch upstream master and tracker
         run: |
           git remote add upstream https://github.com/bitcoin/bitcoin.git
           git fetch upstream master
           git fetch origin upstream-tracker
 
-      - name: Open isolated review PR for each new merge commit
+      - name: Open isolated review PR and run Gemini review for each new merge commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NO_COLOR: 'true'
           MAX_PRS_PER_RUN: 5
+          MAX_DIFF_BYTES: 150000
         run: |
           LAST_SEEN=$(git rev-parse origin/upstream-tracker)
           mapfile -t COMMITS < <(git rev-list --first-parent --reverse "${LAST_SEEN}..upstream/master")
@@ -36,6 +50,18 @@ jobs:
             echo "No new merges found."
             exit 0
           fi
+
+          REVIEW_PROMPT='You are an expert Bitcoin Core reviewer. You are running inside a checkout of the Bitcoin Core repository at the exact merge commit being reviewed, and the merge diff is provided on stdin (truncated if very large — feel free to read any modified or related files in the repository directly for full context).
+
+          Perform a thorough, technical Bitcoin Core review of this merge and structure your response in Markdown with these sections:
+          1. **Summary** — What this merge changes and its motivation.
+          2. **Consensus & Validation** — Any impact on consensus rules, script/tx/block validation, chainstate/UTXO, or reorgs (state "None" if clearly non-consensus).
+          3. **Security, P2P & DoS** — Potential DoS vectors, resource exhaustion, serialization/deserialization issues, UB, integer overflows, or RPC safety concerns.
+          4. **Concurrency & Locking** — Mutex usage, lock ordering (`cs_main`, mempool, wallet), thread-safety annotations, and potential races or deadlocks.
+          5. **Code Quality & Test Coverage** — Edge cases, invariants with callers in the codebase, and unit/functional/fuzz test coverage.
+          6. **Overall Assessment & Areas to Double-Check** — Specific files, functions, or lines a human reviewer should inspect closely.
+
+          Be concrete, cite exact file paths and symbol names, and avoid filler.'
 
           COUNT=0
           for SHA in "${COMMITS[@]}"; do
@@ -59,14 +85,42 @@ jobs:
             git push origin "${SHA}^1:refs/heads/${BASE_BRANCH}"
             git push origin "${SHA}:refs/heads/${HEAD_BRANCH}"
 
-            printf '%s\n\n%s\n' \
+            PR_URL=$(printf '%s\n\n%s\n' \
               "Upstream commit: https://github.com/bitcoin/bitcoin/commit/${SHA}" \
               "$BODY" | gh pr create \
               --repo "${{ github.repository }}" \
               --base "$BASE_BRANCH" \
               --head "$HEAD_BRANCH" \
               --title "[Review] $TITLE" \
-              --body-file -
+              --body-file -)
+
+            echo "Created PR: $PR_URL"
+
+            if [ -n "${GEMINI_API_KEY:-}" ]; then
+              echo "Running Gemini CLI review for $SHORT_SHA..."
+              git checkout --detach --force "$SHA"
+
+              DIFF_STAT=$(git diff --stat "${SHA}^1..${SHA}")
+              REVIEW_FILE="/tmp/review-${SHORT_SHA}.md"
+
+              if {
+                printf 'Commit: %s\nTitle: %s\n\nDiff stat:\n%s\n\nDiff:\n' "$SHA" "$TITLE" "$DIFF_STAT"
+                git diff "${SHA}^1..${SHA}" | head -c "$MAX_DIFF_BYTES"
+              } | gemini --approval-mode=plan -p "$REVIEW_PROMPT" > "$REVIEW_FILE"; then
+                if [ -s "$REVIEW_FILE" ]; then
+                  gh pr comment "$PR_URL" \
+                    --repo "${{ github.repository }}" \
+                    --body-file "$REVIEW_FILE"
+                else
+                  echo "Warning: Gemini CLI returned empty output for $SHORT_SHA."
+                fi
+              else
+                echo "Warning: Gemini CLI review failed for $SHORT_SHA; continuing."
+              fi
+              rm -f "$REVIEW_FILE"
+            else
+              echo "GEMINI_API_KEY secret is not set; skipping automated review."
+            fi
 
             LAST_SEEN="$SHA"
             COUNT=$((COUNT + 1))
