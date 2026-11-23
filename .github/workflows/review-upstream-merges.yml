@@ -1,0 +1,75 @@
+name: Create Review PRs for Bitcoin Core Merges
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-merges:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream master and tracker
+        run: |
+          git remote add upstream https://github.com/bitcoin/bitcoin.git
+          git fetch upstream master
+          git fetch origin upstream-tracker
+
+      - name: Open isolated review PR for each new merge commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAX_PRS_PER_RUN: 5
+        run: |
+          LAST_SEEN=$(git rev-parse origin/upstream-tracker)
+          mapfile -t COMMITS < <(git rev-list --first-parent --reverse "${LAST_SEEN}..upstream/master")
+
+          if [ "${#COMMITS[@]}" -eq 0 ]; then
+            echo "No new merges found."
+            exit 0
+          fi
+
+          COUNT=0
+          for SHA in "${COMMITS[@]}"; do
+            if [ "$COUNT" -ge "$MAX_PRS_PER_RUN" ]; then
+              break
+            fi
+
+            SHORT_SHA=$(git rev-parse --short "$SHA")
+            BASE_BRANCH="review/base-${SHORT_SHA}"
+            HEAD_BRANCH="review/merge-${SHORT_SHA}"
+
+            if git ls-remote --exit-code --heads origin "$HEAD_BRANCH" >/dev/null 2>&1; then
+              echo "Branch $HEAD_BRANCH already exists, skipping."
+              LAST_SEEN="$SHA"
+              continue
+            fi
+
+            TITLE=$(git log -1 --format=%s "$SHA")
+            BODY=$(git log -1 --format=%b "$SHA")
+
+            git push origin "${SHA}^1:refs/heads/${BASE_BRANCH}"
+            git push origin "${SHA}:refs/heads/${HEAD_BRANCH}"
+
+            printf '%s\n\n%s\n' \
+              "Upstream commit: https://github.com/bitcoin/bitcoin/commit/${SHA}" \
+              "$BODY" | gh pr create \
+              --repo "${{ github.repository }}" \
+              --base "$BASE_BRANCH" \
+              --head "$HEAD_BRANCH" \
+              --title "[Review] $TITLE" \
+              --body-file -
+
+            LAST_SEEN="$SHA"
+            COUNT=$((COUNT + 1))
+          done
+
+          git push origin "${LAST_SEEN}:refs/heads/upstream-tracker" --force
