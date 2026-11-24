@@ -2,7 +2,7 @@ name: Create Review PRs for Bitcoin Core Merges
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       gemini_model:
