@@ -116,26 +116,46 @@ jobs:
             BASE_BRANCH="review/base-${SHORT_SHA}"
             HEAD_BRANCH="review/merge-${SHORT_SHA}"
 
-            if git ls-remote --exit-code --heads origin "$HEAD_BRANCH" >/dev/null 2>&1; then
-              echo "Branch $HEAD_BRANCH already exists, skipping."
+            EXISTING_PR=$(gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --head "$HEAD_BRANCH" \
+              --state open \
+              --json url \
+              --jq '.[0].url // empty')
+
+            if [ -n "$EXISTING_PR" ]; then
+              echo "Open PR already exists for $HEAD_BRANCH ($EXISTING_PR), skipping."
               LAST_SEEN="$SHA"
+              git push origin "${LAST_SEEN}:refs/heads/upstream-tracker" --force
               continue
             fi
 
             TITLE=$(git log -1 --format=%s "$SHA")
             BODY=$(git log -1 --format=%b "$SHA")
 
-            git push origin "${SHA}^1:refs/heads/${BASE_BRANCH}"
-            git push origin "${SHA}:refs/heads/${HEAD_BRANCH}"
+            git push --force origin "${SHA}^1:refs/heads/${BASE_BRANCH}"
+            git push --force origin "${SHA}:refs/heads/${HEAD_BRANCH}"
 
-            PR_URL=$(printf '%s\n\n%s\n' \
-              "Upstream commit: https://github.com/bitcoin/bitcoin/commit/${SHA}" \
-              "$BODY" | gh pr create \
-              --repo "$GITHUB_REPOSITORY" \
-              --base "$BASE_BRANCH" \
-              --head "$HEAD_BRANCH" \
-              --title "[Review] $TITLE" \
-              --body-file -)
+            PR_URL=""
+            for ATTEMPT in 1 2 3; do
+              if PR_URL=$(printf '%s\n\n%s\n' \
+                "Upstream commit: https://github.com/bitcoin/bitcoin/commit/${SHA}" \
+                "$BODY" | gh pr create \
+                --repo "$GITHUB_REPOSITORY" \
+                --base "$BASE_BRANCH" \
+                --head "$HEAD_BRANCH" \
+                --title "[Review] $TITLE" \
+                --body-file -); then
+                break
+              fi
+              echo "gh pr create failed (attempt ${ATTEMPT}/3); retrying in $((ATTEMPT * 5))s..."
+              sleep $((ATTEMPT * 5))
+            done
+
+            if [ -z "$PR_URL" ]; then
+              echo "Error: failed to create PR for $SHORT_SHA after 3 attempts."
+              exit 1
+            fi
 
             echo "Created PR: $PR_URL"
 
@@ -158,7 +178,7 @@ jobs:
               if {
                 printf 'Commit: %s\nTitle: %s\n\nDiff stat:\n%s\n\nDiff:\n' "$SHA" "$TITLE" "$DIFF_STAT"
                 (set +o pipefail; git diff "${SHA}^1..${SHA}" | head -c "$MAX_DIFF_BYTES")
-              } | env -u GH_TOKEN -u GITHUB_TOKEN timeout 180 gemini \
+              } | env -u GH_TOKEN -u GITHUB_TOKEN GEMINI_CLI_TRUST_WORKSPACE=true timeout 180 gemini \
                 --model "$GEMINI_MODEL" \
                 --approval-mode=plan \
                 --output-format json \
@@ -172,9 +192,15 @@ jobs:
                     printf '\n\n---\n<details>\n<summary>📊 Token Usage & Review Stats</summary>\n\n%s\n</details>\n' "$USAGE_TABLE"
                   } > "$REVIEW_MD"
 
-                  gh pr comment "$PR_URL" \
-                    --repo "$GITHUB_REPOSITORY" \
-                    --body-file "$REVIEW_MD"
+                  for ATTEMPT in 1 2 3; do
+                    if gh pr comment "$PR_URL" \
+                      --repo "$GITHUB_REPOSITORY" \
+                      --body-file "$REVIEW_MD"; then
+                      break
+                    fi
+                    echo "gh pr comment failed (attempt ${ATTEMPT}/3); retrying in $((ATTEMPT * 5))s..."
+                    sleep $((ATTEMPT * 5))
+                  done
 
                   {
                     printf '### [%s](%s) (`%s`)\n\n%s\n\n' "$TITLE" "$PR_URL" "$SHORT_SHA" "$USAGE_TABLE"
@@ -191,7 +217,6 @@ jobs:
             fi
 
             LAST_SEEN="$SHA"
+            git push origin "${LAST_SEEN}:refs/heads/upstream-tracker" --force
             COUNT=$((COUNT + 1))
           done
-
-          git push origin "${LAST_SEEN}:refs/heads/upstream-tracker" --force
