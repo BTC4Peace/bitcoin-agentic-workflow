@@ -1,8 +1,7 @@
 name: Create Review PRs for Bitcoin Core Merges
 
 on:
-  schedule:
-    - cron: '0 0 * * *'
+  # TODO: Re-enable daily schedule (cron: '0 0 * * *') once manual testing is complete
   workflow_dispatch:
     inputs:
       deepseek_model:
