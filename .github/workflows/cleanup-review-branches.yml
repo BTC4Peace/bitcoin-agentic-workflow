@@ -1,8 +1,10 @@
 name: Cleanup Review Branches
 
 on:
-  pull_request:
+  pull_request_target:
     types: [closed]
+    branches:
+      - 'review/base-*'
 
 permissions:
   contents: write
