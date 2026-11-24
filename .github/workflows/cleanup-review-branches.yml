@@ -1,38 +1,62 @@
 name: Cleanup Review Branches
 
 on:
-  pull_request_target:
-    types: [closed]
-    branches:
-      - 'review/base-*'
+  schedule:
+    - cron: '30 0 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
+  pull-requests: read
+
+concurrency:
+  group: sync-bitcoin-core-merges
+  cancel-in-progress: false
 
 jobs:
   cleanup:
-    if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      startsWith(github.event.pull_request.head.ref, 'review/merge-') &&
-      startsWith(github.event.pull_request.base.ref, 'review/base-')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Delete review branches
+      - name: Delete review branches not used by any open PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          if [[ ! "$HEAD_REF" =~ ^review/merge-[0-9a-f]{7,40}$ ]]; then
-            echo "Refusing to delete unexpected head ref: $HEAD_REF"
-            exit 1
-          fi
-          if [[ ! "$BASE_REF" =~ ^review/base-[0-9a-f]{7,40}$ ]]; then
-            echo "Refusing to delete unexpected base ref: $BASE_REF"
-            exit 1
-          fi
+          # Fetch open PR branches first (fail fast if API errors so open PR branches are never deleted)
+          OPEN_PR_REFS=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --limit 1000 \
+            --json headRefName,baseRefName \
+            --jq '.[] | .headRefName, .baseRefName')
 
-          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${HEAD_REF}" || true
-          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BASE_REF}" || true
+          declare -A ACTIVE_REFS=()
+          while IFS= read -r REF; do
+            [ -n "$REF" ] && ACTIVE_REFS["$REF"]=1
+          done <<< "$OPEN_PR_REFS"
+
+          REVIEW_REFS=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/git/matching-refs/heads/review/" \
+            --jq '.[].ref | sub("^refs/heads/"; "")')
+
+          DELETED=0
+          while IFS= read -r BRANCH; do
+            [ -z "$BRANCH" ] && continue
+
+            if [[ ! "$BRANCH" =~ ^review/(merge|base)-[0-9a-f]{7,40}$ ]]; then
+              echo "Skipping unexpected ref: $BRANCH"
+              continue
+            fi
+
+            if [ -n "${ACTIVE_REFS[$BRANCH]:-}" ]; then
+              echo "Keeping active PR branch: $BRANCH"
+              continue
+            fi
+
+            echo "Deleting closed/orphaned review branch: $BRANCH"
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" || true
+            DELETED=$((DELETED + 1))
+          done <<< "$REVIEW_REFS"
+
+          echo "Cleanup complete. Deleted ${DELETED} branch(es)."
