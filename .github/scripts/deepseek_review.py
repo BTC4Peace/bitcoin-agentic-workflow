@@ -21,6 +21,7 @@ from typing import Any
 
 API_URL = "https://api.deepseek.com/chat/completions"
 MAX_TOOL_ROUNDS = 8
+MAX_TOOL_CALLS_PER_ROUND = 6
 MAX_TOOL_OUTPUT_BYTES = 16_000
 MAX_READ_LINES = 300
 HTTP_TIMEOUT_SECONDS = 180
@@ -252,7 +253,7 @@ def execute_tool(repo_root: Path, name: str, raw_args: str) -> str:
         if name == "list_dir":
             return tool_list_dir(repo_root, parsed)
         return f"Error: unknown tool '{name}'."
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         return f"Error: {exc}"
 
 
@@ -358,14 +359,21 @@ def main() -> int:
 
     for round_idx in range(MAX_TOOL_ROUNDS + 1):
         allow_tools = round_idx < MAX_TOOL_ROUNDS
+        if not allow_tools:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "You have reached the tool-call limit. Please write your final structured Markdown review now.",
+                }
+            )
+
         payload: dict[str, Any] = {
             "model": args.model,
             "messages": messages,
+            "tools": TOOLS,
+            "tool_choice": "auto" if allow_tools else "none",
             "stream": False,
         }
-        if allow_tools:
-            payload["tools"] = TOOLS
-            payload["tool_choice"] = "auto"
 
         resp = call_deepseek(api_key, payload)
         api_calls += 1
@@ -397,7 +405,16 @@ def main() -> int:
                 assistant_msg["reasoning_content"] = msg["reasoning_content"]
             messages.append(assistant_msg)
 
-            for tc in tool_calls:
+            for idx, tc in enumerate(tool_calls):
+                if idx >= MAX_TOOL_CALLS_PER_ROUND:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", ""),
+                            "content": f"Skipped: max {MAX_TOOL_CALLS_PER_ROUND} tool calls per round.",
+                        }
+                    )
+                    continue
                 tool_calls_count += 1
                 fn = tc.get("function") or {}
                 fn_name = fn.get("name", "")
