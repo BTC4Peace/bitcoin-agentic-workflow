@@ -38,7 +38,7 @@ jobs:
         if: env.GEMINI_API_KEY != ''
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: npm install -g @google/gemini-cli
+        run: npm install -g --ignore-scripts --no-fund --no-audit @google/gemini-cli
 
       - name: Fetch upstream master and tracker
         run: |
