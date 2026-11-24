@@ -150,7 +150,14 @@ jobs:
             echo "Created PR: $PR_URL"
 
             if [ -n "${DEEPSEEK_API_KEY:-}" ]; then
-              echo "Running DeepSeek (${DEEPSEEK_MODEL}) agentic review for $SHORT_SHA..."
+              CHANGED_FILES=$(git diff --name-only "${SHA}^1..${SHA}")
+              if grep -q '^src/' <<< "$CHANGED_FILES"; then
+                MAX_ROUNDS=12
+              else
+                MAX_ROUNDS=8
+              fi
+
+              echo "Running DeepSeek (${DEEPSEEK_MODEL}, max ${MAX_ROUNDS} rounds) agentic review for $SHORT_SHA..."
               git checkout --detach --force "$SHA"
               DIFF_STAT=$(git diff --stat "${SHA}^1..${SHA}")
 
@@ -169,6 +176,7 @@ jobs:
                 timeout 300 python3 "${TMP_DIR}/deepseek_review.py" \
                 --repo-root "$PWD" \
                 --model "$DEEPSEEK_MODEL" \
+                --max-rounds "$MAX_ROUNDS" \
                 --user-file "$USER_FILE" \
                 --output-review "$REVIEW_MD" \
                 --output-stats "$STATS_MD"; then
