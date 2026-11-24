@@ -23,13 +23,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          # Fetch open PR branches first (fail fast if API errors so open PR branches are never deleted)
+          # Fetch same-repo open PR branches only (ignore external fork PRs; fail fast on API error)
           OPEN_PR_REFS=$(gh pr list \
             --repo "$GITHUB_REPOSITORY" \
             --state open \
             --limit 1000 \
-            --json headRefName,baseRefName \
-            --jq '.[] | .headRefName, .baseRefName')
+            --json headRefName,baseRefName,isCrossRepository \
+            --jq '.[] | select(.isCrossRepository == false) | .headRefName, .baseRefName')
 
           declare -A ACTIVE_REFS=()
           while IFS= read -r REF; do

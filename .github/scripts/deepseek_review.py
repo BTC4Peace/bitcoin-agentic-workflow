@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -24,6 +25,9 @@ MAX_TOOL_ROUNDS = 8
 MAX_TOOL_CALLS_PER_ROUND = 6
 MAX_TOOL_OUTPUT_BYTES = 16_000
 MAX_READ_LINES = 300
+MAX_FILE_BYTES = 5 * 1024 * 1024
+MAX_GREP_PATTERN_LEN = 200
+MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
 HTTP_TIMEOUT_SECONDS = 180
 
 SYSTEM_PROMPT = """You are an expert Bitcoin Core reviewer analyzing a merge commit.
@@ -85,7 +89,7 @@ TOOLS = [
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Search pattern (fixed string by default).",
+                        "description": "Search pattern (fixed string by default, max 200 chars).",
                     },
                     "path": {
                         "type": "string",
@@ -126,6 +130,14 @@ def truncate_bytes(text: str, limit: int = MAX_TOOL_OUTPUT_BYTES) -> str:
     return encoded[:limit].decode("utf-8", errors="ignore") + "\n... [truncated]"
 
 
+def sanitize_markdown(text: str) -> str:
+    # Convert external Markdown images ![alt](url) to non-auto-loading links [alt](url)
+    # and escape raw HTML <img tags to prevent tracking pixels / external exfiltration.
+    text = re.sub(r"!(?=\[[^\]]*\]\s*\()", "", text)
+    text = re.sub(r"<(?=\s*/?\s*img\b)", "&lt;", text, flags=re.IGNORECASE)
+    return text
+
+
 def resolve_repo_path(repo_root: Path, rel_path: str) -> Path:
     if not isinstance(rel_path, str) or not rel_path.strip():
         raise ValueError("Path must be a non-empty string.")
@@ -135,7 +147,7 @@ def resolve_repo_path(repo_root: Path, rel_path: str) -> Path:
     if not candidate.is_relative_to(repo_root):
         raise ValueError("Path escapes repository root.")
     rel = candidate.relative_to(repo_root)
-    if rel.parts and rel.parts[0] == ".git":
+    if ".git" in rel.parts:
         raise ValueError("Access to .git is not permitted.")
     return candidate
 
@@ -145,6 +157,14 @@ def tool_read_file(repo_root: Path, args: dict[str, Any]) -> str:
     if not target.is_file():
         return f"Error: file not found: {args.get('path')}"
 
+    try:
+        file_size = target.stat().st_size
+    except OSError as exc:
+        return f"Error stating file: {exc}"
+
+    if file_size > MAX_FILE_BYTES:
+        return f"Error: file exceeds {MAX_FILE_BYTES // (1024 * 1024)} MB read limit ({file_size:,} bytes)."
+
     start = max(1, int(args.get("start_line") or 1))
     end = int(args.get("end_line") or (start + 199))
     if end < start:
@@ -153,12 +173,13 @@ def tool_read_file(repo_root: Path, args: dict[str, Any]) -> str:
         end = start + MAX_READ_LINES - 1
 
     try:
-        raw = target.read_bytes()
+        with target.open("rb") as fh:
+            head_chunk = fh.read(8192)
+            if b"\x00" in head_chunk:
+                return "Error: binary file cannot be read."
+            raw = head_chunk + fh.read()
     except OSError as exc:
         return f"Error reading file: {exc}"
-
-    if b"\x00" in raw[:8192]:
-        return "Error: binary file cannot be read."
 
     lines = raw.decode("utf-8", errors="replace").splitlines()
     total = len(lines)
@@ -177,6 +198,8 @@ def tool_grep_code(repo_root: Path, args: dict[str, Any]) -> str:
     pattern = args.get("pattern", "")
     if not isinstance(pattern, str) or not pattern or "\x00" in pattern:
         return "Error: pattern must be a non-empty string."
+    if len(pattern) > MAX_GREP_PATTERN_LEN:
+        return f"Error: pattern exceeds {MAX_GREP_PATTERN_LEN} characters."
 
     rel_path = args.get("path") or "."
     target = resolve_repo_path(repo_root, rel_path)
@@ -184,7 +207,10 @@ def tool_grep_code(repo_root: Path, args: dict[str, Any]) -> str:
 
     cmd = [
         "git",
+        "-c",
+        "core.fsmonitor=false",
         "grep",
+        "--no-textconv",
         "-n",
         "-I",
         "--max-count=30",
@@ -194,13 +220,22 @@ def tool_grep_code(repo_root: Path, args: dict[str, Any]) -> str:
         "--",
         rel_arg,
     ]
+    # Run git grep with a minimal env (no API keys, literal pathspecs, no system config)
+    clean_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": "/tmp",
+        "GIT_LITERAL_PATHSPECS": "1",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
     try:
         proc = subprocess.run(
             cmd,
             cwd=str(repo_root),
+            env=clean_env,
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=5,
             check=False,
         )
     except subprocess.TimeoutExpired:
@@ -226,10 +261,19 @@ def tool_list_dir(repo_root: Path, args: dict[str, Any]) -> str:
         return f"Error: directory not found: {rel_path}"
 
     entries = []
-    for item in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name)):
+    for item in sorted(target.iterdir(), key=lambda p: p.name):
         if item.name == ".git":
             continue
-        suffix = "/" if item.is_dir() else ""
+        if item.is_symlink():
+            try:
+                resolved = item.resolve()
+            except OSError:
+                continue
+            if not resolved.is_relative_to(repo_root):
+                continue
+            suffix = "/ (symlink)" if resolved.is_dir() else " (symlink)"
+        else:
+            suffix = "/" if item.is_dir() else ""
         entries.append(f"{item.name}{suffix}")
         if len(entries) >= 200:
             entries.append("... [truncated at 200 entries]")
@@ -272,9 +316,12 @@ def call_deepseek(api_key: str, payload: dict[str, Any]) -> dict[str, Any]:
         )
         try:
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                raw = resp.read(MAX_API_RESPONSE_BYTES + 1)
+                if len(raw) > MAX_API_RESPONSE_BYTES:
+                    raise RuntimeError("DeepSeek API response exceeded size limit.")
+                return json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")[:500]
+            body = exc.read(500).decode("utf-8", errors="replace")
             last_err = f"HTTP {exc.code}: {body}"
             if exc.code in (429, 500, 502, 503, 504) and attempt < 3:
                 wait = attempt * 5
@@ -310,13 +357,14 @@ def format_stats_table(
     tool_calls: int,
     elapsed_s: float,
 ) -> str:
+    safe_model = re.sub(r"[^a-zA-Z0-9._/-]", "", model) or "unknown"
     pct = f"{round(cache_hit_tokens / prompt_tokens * 100)}%" if prompt_tokens > 0 else "0%"
     return "\n".join(
         [
             "| Model | Input Tokens | Cache Hit | Output | Reasoning | Total | API Calls | Tool Calls | Latency |",
             "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             (
-                f"| `{model}` | {prompt_tokens:,} | {cache_hit_tokens:,} ({pct}) | "
+                f"| `{safe_model}` | {prompt_tokens:,} | {cache_hit_tokens:,} ({pct}) | "
                 f"{completion_tokens:,} | {reasoning_tokens:,} | {total_tokens:,} | "
                 f"{api_calls} | {tool_calls} | {elapsed_s:.1f}s |"
             ),
@@ -430,7 +478,7 @@ def main() -> int:
                 )
             continue
 
-        final_content = (msg.get("content") or "").strip()
+        final_content = sanitize_markdown((msg.get("content") or "").strip())
         break
 
     if not final_content:

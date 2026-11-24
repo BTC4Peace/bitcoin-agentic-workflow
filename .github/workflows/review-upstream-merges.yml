@@ -31,7 +31,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Checkout fork
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -64,8 +64,10 @@ jobs:
             exit 1
           fi
 
-          # Copy trusted reviewer script from master before checking out upstream merge commits
-          cp .github/scripts/deepseek_review.py /tmp/deepseek_review.py
+          # Private 0700 temp directory; copy trusted reviewer script from master before checking out upstream commits
+          TMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          cp .github/scripts/deepseek_review.py "${TMP_DIR}/deepseek_review.py"
 
           LAST_SEEN=$(git rev-parse "origin/upstream-tracker~${REWIND_MERGES}")
           mapfile -t COMMITS < <(git rev-list --first-parent --reverse "${LAST_SEEN}..upstream/master")
@@ -104,12 +106,13 @@ jobs:
             BASE_BRANCH="review/base-${SHORT_SHA}"
             HEAD_BRANCH="review/merge-${SHORT_SHA}"
 
+            # Ignore cross-repository fork PRs so external forks cannot spoof/suppress reviews
             EXISTING_PR=$(gh pr list \
               --repo "$GITHUB_REPOSITORY" \
               --head "$HEAD_BRANCH" \
               --state open \
-              --json url \
-              --jq '.[0].url // empty')
+              --json url,isCrossRepository \
+              --jq '[.[] | select(.isCrossRepository == false)][0].url // empty')
 
             if [ -n "$EXISTING_PR" ]; then
               echo "Open PR already exists for $HEAD_BRANCH ($EXISTING_PR), skipping."
@@ -152,9 +155,9 @@ jobs:
               git checkout --detach --force "$SHA"
               DIFF_STAT=$(git diff --stat "${SHA}^1..${SHA}")
 
-              USER_FILE="/tmp/deepseek-user-${SHORT_SHA}.txt"
-              REVIEW_MD="/tmp/review-${SHORT_SHA}.md"
-              STATS_MD="/tmp/stats-${SHORT_SHA}.md"
+              USER_FILE="${TMP_DIR}/deepseek-user-${SHORT_SHA}.txt"
+              REVIEW_MD="${TMP_DIR}/review-${SHORT_SHA}.md"
+              STATS_MD="${TMP_DIR}/stats-${SHORT_SHA}.md"
 
               {
                 printf 'Commit: %s\nTitle: %s\n\nCommit message:\n%s\n\nDiff stat:\n%s\n\nDiff (full function context, capped at %s bytes):\n' \
@@ -162,7 +165,9 @@ jobs:
                 (set +o pipefail; git diff -W "${SHA}^1..${SHA}" -- . ':!src/qt/locale/*.ts' | head -c "$MAX_DIFF_BYTES")
               } > "$USER_FILE"
 
-              if env -u GH_TOKEN -u GITHUB_TOKEN timeout 300 python3 /tmp/deepseek_review.py \
+              # Run reviewer without GitHub / Actions runtime tokens in its environment
+              if env -u GH_TOKEN -u GITHUB_TOKEN -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u RUNNER_TEMP \
+                timeout 300 python3 "${TMP_DIR}/deepseek_review.py" \
                 --repo-root "$PWD" \
                 --model "$DEEPSEEK_MODEL" \
                 --user-file "$USER_FILE" \
@@ -170,8 +175,9 @@ jobs:
                 --output-stats "$STATS_MD"; then
 
                 post_pr_comment "$PR_URL" "$REVIEW_MD"
+                SAFE_TITLE=$(printf '%s' "$TITLE" | tr -d '[]\r\n')
                 {
-                  printf '### [%s](%s) (`%s`)\n\n' "$TITLE" "$PR_URL" "$SHORT_SHA"
+                  printf '### [%s](%s) (`%s`)\n\n' "$SAFE_TITLE" "$PR_URL" "$SHORT_SHA"
                   cat "$STATS_MD"
                   printf '\n\n'
                 } >> "$GITHUB_STEP_SUMMARY"
