@@ -1,4 +1,4 @@
-"""Shared system prompt, Markdown sanitization, and stats formatting."""
+"""Shared system prompt, Markdown sanitization, triage detection, and stats formatting."""
 
 from __future__ import annotations
 
@@ -28,12 +28,20 @@ Structure your final audit in Markdown with these sections:
 3. **Security, P2P & DoS** — Potential DoS vectors, resource exhaustion, serialization/deserialization issues, UB, integer overflows, or RPC safety concerns.
 4. **Concurrency & Locking** — Mutex usage, lock ordering (`cs_main`, mempool, wallet), thread-safety annotations, and potential races or deadlocks.
 5. **Code Quality & Test Coverage** — Edge cases, invariants with callers in the codebase, and unit/functional/fuzz test coverage.
-6. **Post-Merge Audit Verdict & Lines to Double-Check** — Overall risk level, any recommended follow-up PRs, and the specific files/lines a human auditor should inspect closely."""
+6. **Post-Merge Audit Verdict & Lines to Double-Check** — Overall risk level, any recommended follow-up PRs, and the specific files/lines a human auditor should inspect closely.
+   End Section 6 with an explicit final line:
+   - `Triage: help-wanted` — if this merge introduces a real `[Bug]`, a medium/high `[Risk]`, or a concrete `[Follow-up]` fix needed (e.g. broken/incomplete fix, missed edge case, or stale docs caused by this merge).
+   - `Triage: routine` — if there are only `[Nit]`s, optional cosmetic cleanups, or pre-existing limitations not caused by this merge."""
 
 FINAL_ROUND_NUDGE = (
     "You have reached the tool-call limit. "
     "Please write your final structured Markdown audit now."
 )
+
+_TRIAGE_RE = re.compile(
+    r"(?im)^\s*(?:[-*]\s*)?\*{0,2}Triage\*{0,2}\s*:\s*`?(help-wanted|routine)`?\b"
+)
+_BUG_TAG_RE = re.compile(r"\[\s*Bug\s*\]")
 
 
 def sanitize_markdown(text: str) -> str:
@@ -41,6 +49,14 @@ def sanitize_markdown(text: str) -> str:
     text = re.sub(r"!(?=\[[^\]]*\]\s*\()", "", text)
     text = re.sub(r"<(?=\s*/?\s*img\b)", "&lt;", text, flags=re.IGNORECASE)
     return text
+
+
+def detect_help_wanted(text: str) -> bool:
+    """Return True if the audit flagged Triage: help-wanted (or [Bug] as fallback)."""
+    matches = _TRIAGE_RE.findall(text)
+    if matches:
+        return matches[-1].lower() == "help-wanted"
+    return bool(_BUG_TAG_RE.search(text))
 
 
 def format_stats_table(

@@ -19,7 +19,13 @@ _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from reviewer.prompt import FINAL_ROUND_NUDGE, SYSTEM_PROMPT, format_stats_table, sanitize_markdown
+from reviewer.prompt import (
+    FINAL_ROUND_NUDGE,
+    SYSTEM_PROMPT,
+    detect_help_wanted,
+    format_stats_table,
+    sanitize_markdown,
+)
 from reviewer.providers import PROVIDERS, create_provider
 from reviewer.providers.base import TokenUsage
 from reviewer.tools import TOOL_SPECS, execute_tool
@@ -46,6 +52,7 @@ def main() -> int:
     parser.add_argument("--user-file", required=True)
     parser.add_argument("--output-review", required=True)
     parser.add_argument("--output-stats", required=True)
+    parser.add_argument("--output-meta", default="")
     parser.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_TOOL_ROUNDS)
     args = parser.parse_args()
 
@@ -110,6 +117,7 @@ def main() -> int:
         return 1
 
     elapsed_s = time.monotonic() - start_time
+    help_wanted = detect_help_wanted(final_content)
     stats_table = format_stats_table(
         provider=args.provider,
         model=resolved_model,
@@ -133,6 +141,11 @@ def main() -> int:
 
     Path(args.output_review).write_text(review_md, encoding="utf-8")
     Path(args.output_stats).write_text(stats_table, encoding="utf-8")
+    if args.output_meta:
+        Path(args.output_meta).write_text(
+            json.dumps({"help_wanted": help_wanted}) + "\n",
+            encoding="utf-8",
+        )
     return 0
 
 

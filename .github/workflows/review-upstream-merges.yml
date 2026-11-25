@@ -27,6 +27,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 concurrency:
   group: sync-bitcoin-core-merges
@@ -191,6 +192,7 @@ jobs:
               USER_FILE="${TMP_DIR}/user-${SHORT_SHA}.txt"
               REVIEW_MD="${TMP_DIR}/review-${SHORT_SHA}.md"
               STATS_MD="${TMP_DIR}/stats-${SHORT_SHA}.md"
+              META_JSON="${TMP_DIR}/meta-${SHORT_SHA}.json"
 
               git diff -W "${SHA}^1..${SHA}" -- . ':!src/qt/locale/*.ts' > "$DIFF_FILE"
               DIFF_SIZE=$(wc -c < "$DIFF_FILE")
@@ -228,12 +230,28 @@ jobs:
                   --max-rounds "$MAX_ROUNDS" \
                   --user-file "$USER_FILE" \
                   --output-review "$REVIEW_MD" \
-                  --output-stats "$STATS_MD"
+                  --output-stats "$STATS_MD" \
+                  --output-meta "$META_JSON"
               ); then
                 post_pr_comment "$PR_URL" "$REVIEW_MD" || true
+
+                TRIAGE_BADGE=""
+                if [ -f "$META_JSON" ] && jq -e '.help_wanted == true' "$META_JSON" >/dev/null 2>&1; then
+                  echo "Audit flagged help-wanted for $SHORT_SHA; labeling PR..."
+                  gh label create "help wanted" \
+                    --repo "$GITHUB_REPOSITORY" \
+                    --color "008672" \
+                    --description "AI audit flagged a bug, risk, or concrete follow-up fix" \
+                    2>/dev/null || true
+                  gh pr edit "$PR_URL" \
+                    --repo "$GITHUB_REPOSITORY" \
+                    --add-label "help wanted" || true
+                  TRIAGE_BADGE=" — 🏷️ \`help wanted\`"
+                fi
+
                 SAFE_TITLE=$(printf '%s' "$TITLE" | tr -d '[]\r\n')
                 {
-                  printf '### [%s](%s) (`%s`)\n\n' "$SAFE_TITLE" "$PR_URL" "$SHORT_SHA"
+                  printf '### [%s](%s) (`%s`)%s\n\n' "$SAFE_TITLE" "$PR_URL" "$SHORT_SHA" "$TRIAGE_BADGE"
                   cat "$STATS_MD"
                   printf '\n\n'
                 } >> "$GITHUB_STEP_SUMMARY"
@@ -241,7 +259,7 @@ jobs:
                 echo "Warning: ${AI_PROVIDER} review failed or timed out for $SHORT_SHA; continuing."
               fi
 
-              rm -f "$USER_FILE" "$REVIEW_MD" "$STATS_MD"
+              rm -f "$USER_FILE" "$REVIEW_MD" "$STATS_MD" "$META_JSON"
             else
               echo "API key secret for provider '${AI_PROVIDER}' is not set; skipping automated review."
             fi
