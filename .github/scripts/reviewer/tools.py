@@ -156,7 +156,7 @@ def tool_grep_code(repo_root: Path, args: dict[str, Any]) -> str:
         "-n",
         "-I",
         "--max-count=30",
-        "-E" if args.get("regex") else "-F",
+        "-E" if args.get("regex") is True else "-F",
         "-e",
         pattern,
         "--",

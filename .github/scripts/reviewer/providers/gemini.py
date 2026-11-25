@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from typing import Any
 
 from reviewer.http_client import post_json
@@ -110,7 +111,8 @@ class GeminiProvider(BaseProvider):
             block_reason = (resp.get("promptFeedback") or {}).get("blockReason")
             raise RuntimeError(f"Gemini returned no candidates (blockReason={block_reason}).")
 
-        content = candidates[0].get("content") or {}
+        cand = candidates[0]
+        content = cand.get("content") or {}
         parts = content.get("parts") or []
 
         tool_calls: list[ToolCall] = []
@@ -130,8 +132,16 @@ class GeminiProvider(BaseProvider):
             elif not part.get("thought") and isinstance(part.get("text"), str):
                 text_chunks.append(part["text"])
 
+        text = "".join(text_chunks).strip()
+        if not text and not tool_calls:
+            finish_reason = cand.get("finishReason")
+            print(
+                f"Warning: Gemini returned empty content (finishReason={finish_reason}).",
+                file=sys.stderr,
+            )
+
         return TurnResult(
-            text="".join(text_chunks).strip(),
+            text=text,
             tool_calls=tool_calls,
             usage=usage,
             model=str(resp.get("modelVersion") or self._model),
@@ -146,7 +156,9 @@ class GeminiProvider(BaseProvider):
         # Echo raw model content verbatim to preserve thoughtSignature on thinking models
         raw_content = turn.raw_assistant
         if isinstance(raw_content, dict) and raw_content.get("parts"):
-            self._contents.append(raw_content)
+            echoed = dict(raw_content)
+            echoed.setdefault("role", "model")
+            self._contents.append(echoed)
 
         response_parts = []
         for call, output in results:

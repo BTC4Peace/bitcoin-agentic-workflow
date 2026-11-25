@@ -54,8 +54,11 @@ jobs:
             fi
 
             echo "Deleting closed/orphaned review branch: $BRANCH"
-            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" || true
-            DELETED=$((DELETED + 1))
+            if gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}"; then
+              DELETED=$((DELETED + 1))
+            else
+              echo "Warning: failed to delete branch: $BRANCH"
+            fi
           done <<< "$REVIEW_REFS"
 
           echo "Cleanup complete. Deleted ${DELETED} branch(es)."

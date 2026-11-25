@@ -230,7 +230,7 @@ jobs:
                   --output-review "$REVIEW_MD" \
                   --output-stats "$STATS_MD"
               ); then
-                post_pr_comment "$PR_URL" "$REVIEW_MD"
+                post_pr_comment "$PR_URL" "$REVIEW_MD" || true
                 SAFE_TITLE=$(printf '%s' "$TITLE" | tr -d '[]\r\n')
                 {
                   printf '### [%s](%s) (`%s`)\n\n' "$SAFE_TITLE" "$PR_URL" "$SHORT_SHA"

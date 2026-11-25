@@ -12,6 +12,7 @@ from typing import Any
 
 HTTP_TIMEOUT_SECONDS = 180
 MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_RETRY_AFTER_SECONDS = 30
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -22,6 +23,15 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 _OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _retry_delay(exc: urllib.error.HTTPError, attempt: int) -> int:
+    default_wait = attempt * 5
+    if exc.code == 429 and exc.headers:
+        retry_after = exc.headers.get("Retry-After", "").strip()
+        if retry_after.isdigit():
+            return max(1, min(int(retry_after), MAX_RETRY_AFTER_SECONDS))
+    return default_wait
 
 
 def post_json(
@@ -51,7 +61,7 @@ def post_json(
             body = exc.read(500).decode("utf-8", errors="replace")
             last_err = f"HTTP {exc.code}: {body}"
             if exc.code in (429, 500, 502, 503, 504) and attempt < 3:
-                wait = attempt * 5
+                wait = _retry_delay(exc, attempt)
                 print(
                     f"{provider_label} returned HTTP {exc.code} (attempt {attempt}/3); retrying in {wait}s...",
                     file=sys.stderr,
