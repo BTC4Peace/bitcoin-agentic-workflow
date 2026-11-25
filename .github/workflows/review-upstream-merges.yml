@@ -161,15 +161,27 @@ jobs:
               git checkout --detach --force "$SHA"
               DIFF_STAT=$(git diff --stat "${SHA}^1..${SHA}")
 
+              DIFF_FILE="${TMP_DIR}/diff-${SHORT_SHA}.patch"
               USER_FILE="${TMP_DIR}/deepseek-user-${SHORT_SHA}.txt"
               REVIEW_MD="${TMP_DIR}/review-${SHORT_SHA}.md"
               STATS_MD="${TMP_DIR}/stats-${SHORT_SHA}.md"
 
+              git diff -W "${SHA}^1..${SHA}" -- . ':!src/qt/locale/*.ts' > "$DIFF_FILE"
+              DIFF_SIZE=$(wc -c < "$DIFF_FILE")
+              if [ "$DIFF_SIZE" -le "$MAX_DIFF_BYTES" ]; then
+                DIFF_MODE="full function context (-W)"
+              else
+                echo "Full function diff (${DIFF_SIZE} bytes) exceeds ${MAX_DIFF_BYTES} bytes; falling back to compact unified diff (-U3) to cover all changed files."
+                git diff -U3 "${SHA}^1..${SHA}" -- . ':!src/qt/locale/*.ts' > "$DIFF_FILE"
+                DIFF_MODE="compact unified diff (-U3, capped at ${MAX_DIFF_BYTES} bytes)"
+              fi
+
               {
-                printf 'Commit: %s\nTitle: %s\n\nCommit message:\n%s\n\nDiff stat:\n%s\n\nDiff (full function context, capped at %s bytes):\n' \
-                  "$SHA" "$TITLE" "$BODY" "$DIFF_STAT" "$MAX_DIFF_BYTES"
-                (set +o pipefail; git diff -W "${SHA}^1..${SHA}" -- . ':!src/qt/locale/*.ts' | head -c "$MAX_DIFF_BYTES")
+                printf 'Commit: %s\nTitle: %s\n\nCommit message:\n%s\n\nDiff stat:\n%s\n\nDiff (%s):\n' \
+                  "$SHA" "$TITLE" "$BODY" "$DIFF_STAT" "$DIFF_MODE"
+                (set +o pipefail; head -c "$MAX_DIFF_BYTES" "$DIFF_FILE")
               } > "$USER_FILE"
+              rm -f "$DIFF_FILE"
 
               # Run reviewer without GitHub / Actions runtime tokens in its environment
               if env -u GH_TOKEN -u GITHUB_TOKEN -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u RUNNER_TEMP \
