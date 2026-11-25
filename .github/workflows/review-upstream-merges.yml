@@ -4,10 +4,18 @@ on:
   # TODO: Re-enable daily schedule (cron: '0 0 * * *') once manual testing is complete
   workflow_dispatch:
     inputs:
-      deepseek_model:
-        description: 'DeepSeek model to use for reviews (e.g. deepseek-flash, deepseek-chat, deepseek-reasoner)'
+      provider:
+        description: 'AI provider to run the post-merge audit'
         required: false
-        default: 'deepseek-flash'
+        default: 'deepseek'
+        type: choice
+        options:
+          - deepseek
+          - gemini
+      model:
+        description: 'Optional model override (defaults: deepseek-flash / gemini-4-neon)'
+        required: false
+        default: ''
         type: string
       # TODO: Remove rewind_merges input once manual testing is complete
       rewind_merges:
@@ -40,20 +48,38 @@ jobs:
           git fetch upstream master
           git fetch origin upstream-tracker
 
-      - name: Open isolated review PR and run DeepSeek agentic review for each new merge commit
+      - name: Open isolated review PR and run agentic post-merge audit for each new merge commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          DEEPSEEK_MODEL: ${{ inputs.deepseek_model || 'deepseek-flash' }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AI_PROVIDER: ${{ inputs.provider || 'deepseek' }}
+          AI_MODEL: ${{ inputs.model || '' }}
           # TODO: Remove REWIND_MERGES once manual testing is complete
           REWIND_MERGES: ${{ inputs.rewind_merges || '0' }}
           MAX_PRS_PER_RUN: 5
           MAX_DIFF_BYTES: 200000
         run: |
-          # Validate model name to prevent unexpected API values
-          if [[ ! "$DEEPSEEK_MODEL" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-            echo "Invalid DEEPSEEK_MODEL value: $DEEPSEEK_MODEL"
+          # Strict allowlist validation for provider and optional model override
+          case "$AI_PROVIDER" in
+            deepseek)
+              SELECTED_API_KEY="${DEEPSEEK_API_KEY:-}"
+              DEFAULT_MODEL="deepseek-flash"
+              ;;
+            gemini)
+              SELECTED_API_KEY="${GEMINI_API_KEY:-}"
+              DEFAULT_MODEL="gemini-4-neon"
+              ;;
+            *)
+              echo "Invalid AI_PROVIDER value: $AI_PROVIDER"
+              exit 1
+              ;;
+          esac
+
+          EFFECTIVE_MODEL="${AI_MODEL:-$DEFAULT_MODEL}"
+          if [[ ! "$EFFECTIVE_MODEL" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            echo "Invalid AI_MODEL value: $EFFECTIVE_MODEL"
             exit 1
           fi
 
@@ -63,10 +89,10 @@ jobs:
             exit 1
           fi
 
-          # Private 0700 temp directory; copy trusted reviewer script from master before checking out upstream commits
+          # Private 0700 temp directory; copy trusted reviewer package from master before checking out upstream commits
           TMP_DIR=$(mktemp -d)
           trap 'rm -rf "$TMP_DIR"' EXIT
-          cp .github/scripts/deepseek_review.py "${TMP_DIR}/deepseek_review.py"
+          cp -R .github/scripts "${TMP_DIR}/scripts"
 
           LAST_SEEN=$(git rev-parse "origin/upstream-tracker~${REWIND_MERGES}")
           mapfile -t COMMITS < <(git rev-list --first-parent --reverse "${LAST_SEEN}..upstream/master")
@@ -149,7 +175,7 @@ jobs:
 
             echo "Created PR: $PR_URL"
 
-            if [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+            if [ -n "$SELECTED_API_KEY" ]; then
               CHANGED_FILES=$(git diff --name-only "${SHA}^1..${SHA}")
               if grep -q '^src/' <<< "$CHANGED_FILES"; then
                 MAX_ROUNDS=12
@@ -157,12 +183,12 @@ jobs:
                 MAX_ROUNDS=8
               fi
 
-              echo "Running DeepSeek (${DEEPSEEK_MODEL}, max ${MAX_ROUNDS} rounds) agentic review for $SHORT_SHA..."
+              echo "Running ${AI_PROVIDER} (${EFFECTIVE_MODEL}, max ${MAX_ROUNDS} rounds) agentic review for $SHORT_SHA..."
               git checkout --detach --force "$SHA"
               DIFF_STAT=$(git diff --stat "${SHA}^1..${SHA}")
 
               DIFF_FILE="${TMP_DIR}/diff-${SHORT_SHA}.patch"
-              USER_FILE="${TMP_DIR}/deepseek-user-${SHORT_SHA}.txt"
+              USER_FILE="${TMP_DIR}/user-${SHORT_SHA}.txt"
               REVIEW_MD="${TMP_DIR}/review-${SHORT_SHA}.md"
               STATS_MD="${TMP_DIR}/stats-${SHORT_SHA}.md"
 
@@ -191,16 +217,19 @@ jobs:
               } > "$USER_FILE"
               rm -f "$DIFF_FILE"
 
-              # Run reviewer without GitHub / Actions runtime tokens in its environment
-              if env -u GH_TOKEN -u GITHUB_TOKEN -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u RUNNER_TEMP \
-                timeout 420 python3 "${TMP_DIR}/deepseek_review.py" \
-                --repo-root "$PWD" \
-                --model "$DEEPSEEK_MODEL" \
-                --max-rounds "$MAX_ROUNDS" \
-                --user-file "$USER_FILE" \
-                --output-review "$REVIEW_MD" \
-                --output-stats "$STATS_MD"; then
-
+              # Isolated subshell: pass ONLY the active provider's key via env (never on argv) and strip all other secrets
+              if (
+                export AI_API_KEY="$SELECTED_API_KEY"
+                unset GH_TOKEN GITHUB_TOKEN ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN RUNNER_TEMP DEEPSEEK_API_KEY GEMINI_API_KEY
+                exec timeout 420 python3 -I "${TMP_DIR}/scripts/review.py" \
+                  --provider "$AI_PROVIDER" \
+                  --model "$EFFECTIVE_MODEL" \
+                  --repo-root "$PWD" \
+                  --max-rounds "$MAX_ROUNDS" \
+                  --user-file "$USER_FILE" \
+                  --output-review "$REVIEW_MD" \
+                  --output-stats "$STATS_MD"
+              ); then
                 post_pr_comment "$PR_URL" "$REVIEW_MD"
                 SAFE_TITLE=$(printf '%s' "$TITLE" | tr -d '[]\r\n')
                 {
@@ -209,12 +238,12 @@ jobs:
                   printf '\n\n'
                 } >> "$GITHUB_STEP_SUMMARY"
               else
-                echo "Warning: DeepSeek review failed or timed out for $SHORT_SHA; continuing."
+                echo "Warning: ${AI_PROVIDER} review failed or timed out for $SHORT_SHA; continuing."
               fi
 
               rm -f "$USER_FILE" "$REVIEW_MD" "$STATS_MD"
             else
-              echo "DEEPSEEK_API_KEY secret is not set; skipping automated review."
+              echo "API key secret for provider '${AI_PROVIDER}' is not set; skipping automated review."
             fi
 
             LAST_SEEN="$SHA"
