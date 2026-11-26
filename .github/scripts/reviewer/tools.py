@@ -96,6 +96,8 @@ def resolve_repo_path(repo_root: Path, rel_path: str) -> Path:
 
 def tool_read_file(repo_root: Path, args: dict[str, Any]) -> str:
     target = resolve_repo_path(repo_root, args.get("path", ""))
+    if target.is_dir():
+        return f"Error: path is a directory, not a file: {args.get('path')}"
     if not target.is_file():
         return f"Error: file not found: {args.get('path')}"
 
@@ -107,8 +109,12 @@ def tool_read_file(repo_root: Path, args: dict[str, Any]) -> str:
     if file_size > MAX_FILE_BYTES:
         return f"Error: file exceeds {MAX_FILE_BYTES // (1024 * 1024)} MB read limit ({file_size:,} bytes)."
 
-    start = max(1, int(args.get("start_line") or 1))
-    end = int(args.get("end_line") or (start + 199))
+    raw_start = args.get("start_line")
+    raw_end = args.get("end_line")
+    if isinstance(raw_start, bool) or isinstance(raw_end, bool):
+        raise TypeError("start_line and end_line must be integers, not booleans.")
+    start = max(1, int(raw_start or 1))
+    end = int(raw_end or (start + 199))
     if end < start:
         end = start
     if end - start + 1 > MAX_READ_LINES:
@@ -162,12 +168,14 @@ def tool_grep_code(repo_root: Path, args: dict[str, Any]) -> str:
         "--",
         rel_arg,
     ]
-    # Minimal env: no API keys, literal pathspecs, no system config, no prompts
+    # Minimal env: no API keys, literal pathspecs, no global/system config, no prompts
     clean_env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": "/tmp",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_LITERAL_PATHSPECS": "1",
         "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_ATTR_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
     }
     try:
@@ -176,12 +184,15 @@ def tool_grep_code(repo_root: Path, args: dict[str, Any]) -> str:
             cwd=str(repo_root),
             env=clean_env,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
             check=False,
         )
     except subprocess.TimeoutExpired:
         return "Error: grep timed out."
+    except OSError as exc:
+        return f"Error running git grep: {exc}"
 
     if proc.returncode == 1:
         return "No matches found."
@@ -203,7 +214,11 @@ def tool_list_dir(repo_root: Path, args: dict[str, Any]) -> str:
         return f"Error: directory not found: {rel_path}"
 
     entries = []
-    for item in sorted(target.iterdir(), key=lambda p: p.name):
+    try:
+        children = sorted(target.iterdir(), key=lambda p: p.name)
+    except OSError as exc:
+        return f"Error listing directory: {exc}"
+    for item in children:
         if item.name == ".git":
             continue
         if item.is_symlink():
@@ -211,7 +226,7 @@ def tool_list_dir(repo_root: Path, args: dict[str, Any]) -> str:
                 resolved = item.resolve()
             except OSError:
                 continue
-            if not resolved.is_relative_to(repo_root):
+            if not resolved.is_relative_to(repo_root) or ".git" in resolved.relative_to(repo_root).parts:
                 continue
             suffix = "/ (symlink)" if resolved.is_dir() else " (symlink)"
         else:

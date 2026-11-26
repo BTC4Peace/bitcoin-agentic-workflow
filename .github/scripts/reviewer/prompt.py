@@ -39,14 +39,14 @@ FINAL_ROUND_NUDGE = (
 )
 
 _TRIAGE_RE = re.compile(
-    r"(?im)^\s*(?:[-*]\s*)?\*{0,2}Triage\*{0,2}\s*:\s*`?(help-wanted|routine)`?\b"
+    r"(?im)^\s*(?:[-*]\s*|#{1,6}\s*)?[*_`]{0,3}Triage[*_`]{0,3}\s*:\s*[*_`]{0,3}\s*[*_`]{0,3}(help-wanted|routine)\b[*_`]{0,3}"
 )
 _BUG_TAG_RE = re.compile(r"\[\s*Bug\s*\]")
 
 
 def sanitize_markdown(text: str) -> str:
     """Neutralize external Markdown/HTML images to prevent tracking pixels."""
-    text = re.sub(r"!(?=\[[^\]]*\]\s*\()", "", text)
+    text = re.sub(r"!(?=\[)", "", text)
     text = re.sub(r"<(?=\s*/?\s*img\b)", "&lt;", text, flags=re.IGNORECASE)
     return text
 

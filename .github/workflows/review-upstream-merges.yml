@@ -36,7 +36,7 @@ concurrency:
 jobs:
   sync-merges:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - name: Checkout fork
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -85,7 +85,7 @@ jobs:
           fi
 
           # TODO: Remove REWIND_MERGES handling once manual testing is complete
-          if [[ ! "$REWIND_MERGES" =~ ^[0-9]+$ ]] || [ "$REWIND_MERGES" -gt 5 ]; then
+          if [[ ! "$REWIND_MERGES" =~ ^[0-5]$ ]]; then
             echo "Invalid REWIND_MERGES value (must be 0-5): $REWIND_MERGES"
             exit 1
           fi
@@ -95,7 +95,15 @@ jobs:
           trap 'rm -rf "$TMP_DIR"' EXIT
           cp -R .github/scripts "${TMP_DIR}/scripts"
 
-          LAST_SEEN=$(git rev-parse "origin/upstream-tracker~${REWIND_MERGES}")
+          ORIG_TRACKER=$(git rev-parse "origin/upstream-tracker")
+          LAST_SEEN=$(git rev-parse "${ORIG_TRACKER}~${REWIND_MERGES}")
+          advance_tracker() {
+            local target_sha="$1"
+            if [ "$target_sha" != "$ORIG_TRACKER" ] && git merge-base --is-ancestor "$ORIG_TRACKER" "$target_sha"; then
+              git push origin "${target_sha}:refs/heads/upstream-tracker"
+              ORIG_TRACKER="$target_sha"
+            fi
+          }
           mapfile -t COMMITS < <(git rev-list --first-parent --reverse "${LAST_SEEN}..upstream/master")
 
           if [ "${#COMMITS[@]}" -eq 0 ]; then
@@ -128,7 +136,7 @@ jobs:
               break
             fi
 
-            SHORT_SHA=$(git rev-parse --short "$SHA")
+            SHORT_SHA=$(git rev-parse --short=12 "$SHA")
             BASE_BRANCH="review/base-${SHORT_SHA}"
             HEAD_BRANCH="review/merge-${SHORT_SHA}"
 
@@ -142,26 +150,33 @@ jobs:
 
             if [ -n "$EXISTING_PR" ]; then
               echo "Open PR already exists for $HEAD_BRANCH ($EXISTING_PR), skipping."
-              LAST_SEEN="$SHA"
-              git push origin "${LAST_SEEN}:refs/heads/upstream-tracker" --force
+              advance_tracker "$SHA"
               continue
             fi
 
             TITLE=$(git log -1 --format=%s "$SHA")
+            PR_TITLE="[Review] $TITLE"
+            if [ "${#PR_TITLE}" -gt 256 ]; then
+              PR_TITLE="${PR_TITLE:0:253}..."
+            fi
             BODY=$(git log -1 --format=%b "$SHA")
+            PR_BODY=$(printf '%s\n\n%s' \
+              "Upstream commit: https://github.com/bitcoin/bitcoin/commit/${SHA}" \
+              "$BODY")
+            if [ "${#PR_BODY}" -gt 65000 ]; then
+              PR_BODY="${PR_BODY:0:64950}"$'\n\n... [commit message truncated]'
+            fi
 
             git push --force origin "${SHA}^1:refs/heads/${BASE_BRANCH}"
             git push --force origin "${SHA}:refs/heads/${HEAD_BRANCH}"
 
             PR_URL=""
             for ATTEMPT in 1 2 3; do
-              if PR_URL=$(printf '%s\n\n%s\n' \
-                "Upstream commit: https://github.com/bitcoin/bitcoin/commit/${SHA}" \
-                "$BODY" | gh pr create \
+              if PR_URL=$(printf '%s\n' "$PR_BODY" | gh pr create \
                 --repo "$GITHUB_REPOSITORY" \
                 --base "$BASE_BRANCH" \
                 --head "$HEAD_BRANCH" \
-                --title "[Review] $TITLE" \
+                --title "$PR_TITLE" \
                 --body-file -); then
                 break
               fi
@@ -186,7 +201,7 @@ jobs:
 
               echo "Running ${AI_PROVIDER} (${EFFECTIVE_MODEL}, max ${MAX_ROUNDS} rounds) agentic review for $SHORT_SHA..."
               git checkout --detach --force "$SHA"
-              DIFF_STAT=$(git diff --stat "${SHA}^1..${SHA}")
+              DIFF_STAT=$(git diff --stat "${SHA}^1..${SHA}" -- . ':!src/qt/locale/*.ts')
 
               DIFF_FILE="${TMP_DIR}/diff-${SHORT_SHA}.patch"
               USER_FILE="${TMP_DIR}/user-${SHORT_SHA}.txt"
@@ -209,12 +224,15 @@ jobs:
                 fi
               fi
 
+              escape_tags() {
+                LC_ALL=C sed -E 's#<(/?(commit_metadata|diff_stat|diff)\b)#\&lt;\1#gi'
+              }
               {
                 printf '<commit_metadata>\nCommit: %s\nTitle: %s\n\nCommit message:\n%s\n</commit_metadata>\n\n' \
-                  "$SHA" "$TITLE" "$BODY"
-                printf '<diff_stat>\n%s\n</diff_stat>\n\n' "$DIFF_STAT"
+                  "$SHA" "$(printf '%s' "$TITLE" | escape_tags)" "$(printf '%s' "$BODY" | escape_tags)"
+                printf '<diff_stat>\n%s\n</diff_stat>\n\n' "$(printf '%s' "$DIFF_STAT" | escape_tags)"
                 printf '<diff mode="%s">\n' "$DIFF_MODE"
-                (set +o pipefail; head -c "$MAX_DIFF_BYTES" "$DIFF_FILE")
+                (set +o pipefail; head -c "$MAX_DIFF_BYTES" "$DIFF_FILE" | escape_tags)
                 printf '\n</diff>\n'
               } > "$USER_FILE"
               rm -f "$DIFF_FILE"
@@ -233,7 +251,13 @@ jobs:
                   --output-stats "$STATS_MD" \
                   --output-meta "$META_JSON"
               ); then
-                post_pr_comment "$PR_URL" "$REVIEW_MD" || true
+                if ! post_pr_comment "$PR_URL" "$REVIEW_MD"; then
+                  echo "Error: failed to post review comment on $PR_URL; closing unreviewed PR so next run retries."
+                  gh pr close "$PR_URL" --repo "$GITHUB_REPOSITORY" --delete-branch || true
+                  git push origin --delete "$BASE_BRANCH" 2>/dev/null || true
+                  rm -f "$USER_FILE" "$REVIEW_MD" "$STATS_MD" "$META_JSON"
+                  exit 1
+                fi
 
                 TRIAGE_BADGE=""
                 if [ -f "$META_JSON" ] && jq -e '.help_wanted == true' "$META_JSON" >/dev/null 2>&1; then
@@ -256,7 +280,11 @@ jobs:
                   printf '\n\n'
                 } >> "$GITHUB_STEP_SUMMARY"
               else
-                echo "Warning: ${AI_PROVIDER} review failed or timed out for $SHORT_SHA; continuing."
+                echo "Error: ${AI_PROVIDER} review failed or timed out for $SHORT_SHA; closing unreviewed PR so next run retries."
+                gh pr close "$PR_URL" --repo "$GITHUB_REPOSITORY" --delete-branch || true
+                git push origin --delete "$BASE_BRANCH" 2>/dev/null || true
+                rm -f "$USER_FILE" "$REVIEW_MD" "$STATS_MD" "$META_JSON"
+                exit 1
               fi
 
               rm -f "$USER_FILE" "$REVIEW_MD" "$STATS_MD" "$META_JSON"
@@ -264,7 +292,6 @@ jobs:
               echo "API key secret for provider '${AI_PROVIDER}' is not set; skipping automated review."
             fi
 
-            LAST_SEEN="$SHA"
-            git push origin "${LAST_SEEN}:refs/heads/upstream-tracker" --force
+            advance_tracker "$SHA"
             COUNT=$((COUNT + 1))
           done

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import sys
 import time
@@ -56,9 +57,18 @@ def post_json(
                 raw = resp.read(max_response_bytes + 1)
                 if len(raw) > max_response_bytes:
                     raise RuntimeError(f"{provider_label} response exceeded size limit.")
-                return json.loads(raw.decode("utf-8"))
+                decoded = json.loads(raw.decode("utf-8"))
+                if not isinstance(decoded, dict):
+                    raise RuntimeError(
+                        f"{provider_label} returned non-object JSON ({type(decoded).__name__})."
+                    )
+                return decoded
         except urllib.error.HTTPError as exc:
-            body = exc.read(500).decode("utf-8", errors="replace")
+            body = (
+                exc.read(500).decode("utf-8", errors="replace")
+                if getattr(exc, "fp", None) is not None
+                else str(exc.reason)
+            )
             last_err = f"HTTP {exc.code}: {body}"
             if exc.code in (429, 500, 502, 503, 504) and attempt < 3:
                 wait = _retry_delay(exc, attempt)
@@ -69,7 +79,14 @@ def post_json(
                 time.sleep(wait)
                 continue
             raise RuntimeError(last_err) from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            http.client.HTTPException,
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
             last_err = str(exc)
             if attempt < 3:
                 wait = attempt * 5

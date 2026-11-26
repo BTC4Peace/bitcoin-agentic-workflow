@@ -23,12 +23,9 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           # Fetch same-repo open PR branches only (ignore external fork PRs; fail fast on API error)
-          OPEN_PR_REFS=$(gh pr list \
-            --repo "$GITHUB_REPOSITORY" \
-            --state open \
-            --limit 1000 \
-            --json headRefName,baseRefName,isCrossRepository \
-            --jq '.[] | select(.isCrossRepository == false) | .headRefName, .baseRefName')
+          OPEN_PR_REFS=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=100" \
+            --jq '.[] | select(.head.repo != null and .head.repo.full_name == .base.repo.full_name) | .head.ref, .base.ref')
 
           declare -A ACTIVE_REFS=()
           while IFS= read -r REF; do

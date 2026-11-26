@@ -90,7 +90,10 @@ class GeminiProvider(BaseProvider):
             provider_label="gemini",
         )
 
-        usage_raw = resp.get("usageMetadata") or {}
+        if resp.get("error"):
+            raise RuntimeError(f"Gemini API error: {resp['error']}")
+
+        usage_raw = resp.get("usageMetadata") if isinstance(resp.get("usageMetadata"), dict) else {}
         prompt_tokens = int(usage_raw.get("promptTokenCount") or 0)
         cache_hit = int(usage_raw.get("cachedContentTokenCount") or 0)
         candidates_tokens = int(usage_raw.get("candidatesTokenCount") or 0)
@@ -106,14 +109,15 @@ class GeminiProvider(BaseProvider):
             total=total_tokens,
         )
 
-        candidates = resp.get("candidates") or []
-        if not candidates:
-            block_reason = (resp.get("promptFeedback") or {}).get("blockReason")
+        candidates = resp.get("candidates")
+        if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+            prompt_feedback = resp.get("promptFeedback") if isinstance(resp.get("promptFeedback"), dict) else {}
+            block_reason = prompt_feedback.get("blockReason")
             raise RuntimeError(f"Gemini returned no candidates (blockReason={block_reason}).")
 
         cand = candidates[0]
-        content = cand.get("content") or {}
-        parts = content.get("parts") or []
+        content = cand.get("content") if isinstance(cand.get("content"), dict) else {}
+        parts = content.get("parts") if isinstance(content.get("parts"), list) else []
 
         tool_calls: list[ToolCall] = []
         text_chunks: list[str] = []
@@ -121,24 +125,25 @@ class GeminiProvider(BaseProvider):
             if not isinstance(part, dict):
                 continue
             if "functionCall" in part:
-                fc = part["functionCall"] or {}
-                tool_calls.append(
-                    ToolCall(
-                        id=str(fc.get("id") or ""),
-                        name=str(fc.get("name") or ""),
-                        args=fc.get("args") or {},
+                fc = part["functionCall"]
+                if isinstance(fc, dict):
+                    tool_calls.append(
+                        ToolCall(
+                            id=str(fc.get("id") or ""),
+                            name=str(fc.get("name") or ""),
+                            args=fc.get("args") if isinstance(fc.get("args"), dict) else {},
+                        )
                     )
-                )
             elif not part.get("thought") and isinstance(part.get("text"), str):
                 text_chunks.append(part["text"])
 
         text = "".join(text_chunks).strip()
+        finish_reason = cand.get("finishReason")
         if not text and not tool_calls:
-            finish_reason = cand.get("finishReason")
-            print(
-                f"Warning: Gemini returned empty content (finishReason={finish_reason}).",
-                file=sys.stderr,
-            )
+            raise RuntimeError(f"Gemini returned empty content (finishReason={finish_reason}).")
+        if finish_reason == "MAX_TOKENS" and not tool_calls and text:
+            print("Warning: Gemini output truncated due to MAX_TOKENS.", file=sys.stderr)
+            text += "\n\n> ⚠️ Output truncated by model MAX_TOKENS limit."
 
         return TurnResult(
             text=text,
@@ -157,7 +162,8 @@ class GeminiProvider(BaseProvider):
         raw_content = turn.raw_assistant
         if isinstance(raw_content, dict) and raw_content.get("parts"):
             echoed = dict(raw_content)
-            echoed.setdefault("role", "model")
+            if not echoed.get("role"):
+                echoed["role"] = "model"
             self._contents.append(echoed)
 
         response_parts = []
@@ -173,4 +179,11 @@ class GeminiProvider(BaseProvider):
         self._contents.append({"role": "user", "parts": response_parts})
 
     def append_final_nudge(self, nudge_text: str) -> None:
-        self._contents.append({"role": "user", "parts": [{"text": nudge_text}]})
+        if self._contents and self._contents[-1].get("role") == "user":
+            parts = self._contents[-1].get("parts")
+            if isinstance(parts, list):
+                parts.append({"text": nudge_text})
+            else:
+                self._contents[-1]["parts"] = [{"text": nudge_text}]
+        else:
+            self._contents.append({"role": "user", "parts": [{"text": nudge_text}]})

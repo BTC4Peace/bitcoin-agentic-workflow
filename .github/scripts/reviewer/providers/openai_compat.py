@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 from reviewer.http_client import post_json
@@ -72,9 +73,20 @@ class OpenAICompatProvider(BaseProvider):
             provider_label=self._provider_name,
         )
 
-        usage_raw = resp.get("usage") or {}
-        prompt_details = usage_raw.get("prompt_tokens_details") or {}
-        completion_details = usage_raw.get("completion_tokens_details") or {}
+        if resp.get("error"):
+            raise RuntimeError(f"{self._provider_name} API error: {resp['error']}")
+
+        usage_raw = resp.get("usage") if isinstance(resp.get("usage"), dict) else {}
+        prompt_details = (
+            usage_raw.get("prompt_tokens_details")
+            if isinstance(usage_raw.get("prompt_tokens_details"), dict)
+            else {}
+        )
+        completion_details = (
+            usage_raw.get("completion_tokens_details")
+            if isinstance(usage_raw.get("completion_tokens_details"), dict)
+            else {}
+        )
         cache_hit = int(
             usage_raw.get("prompt_cache_hit_tokens")
             or prompt_details.get("cached_tokens")
@@ -88,25 +100,42 @@ class OpenAICompatProvider(BaseProvider):
             total=int(usage_raw.get("total_tokens") or 0),
         )
 
-        choices = resp.get("choices") or []
-        if not choices:
+        choices = resp.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise RuntimeError(f"{self._provider_name} returned no choices.")
 
-        msg = choices[0].get("message") or {}
+        finish_reason = choices[0].get("finish_reason")
+        msg = choices[0].get("message")
+        if not isinstance(msg, dict):
+            raise RuntimeError(f"{self._provider_name} returned malformed message object.")
+
         raw_tcs = msg.get("tool_calls") or []
         parsed_tcs: list[ToolCall] = []
-        for tc in raw_tcs:
-            fn = tc.get("function") or {}
-            parsed_tcs.append(
-                ToolCall(
-                    id=str(tc.get("id") or ""),
-                    name=str(fn.get("name") or ""),
-                    args=fn.get("arguments", "{}"),
+        if isinstance(raw_tcs, list):
+            for tc in raw_tcs:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                parsed_tcs.append(
+                    ToolCall(
+                        id=str(tc.get("id") or ""),
+                        name=str(fn.get("name") or ""),
+                        args=fn.get("arguments", "{}"),
+                    )
                 )
+
+        content_raw = msg.get("content")
+        text = content_raw.strip() if isinstance(content_raw, str) else ""
+        if not text and not parsed_tcs:
+            raise RuntimeError(
+                f"{self._provider_name} returned empty content (finish_reason={finish_reason}, refusal={msg.get('refusal')})."
             )
+        if finish_reason == "length" and not parsed_tcs and text:
+            print(f"Warning: {self._provider_name} output truncated (finish_reason=length).", file=sys.stderr)
+            text += "\n\n> ⚠️ Output truncated by model max-token limit."
 
         return TurnResult(
-            text=(msg.get("content") or "").strip(),
+            text=text,
             tool_calls=parsed_tcs,
             usage=usage,
             model=str(resp.get("model") or self._model),

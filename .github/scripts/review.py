@@ -33,6 +33,7 @@ from reviewer.tools import TOOL_SPECS, execute_tool
 DEFAULT_MAX_TOOL_ROUNDS = 8
 MAX_ALLOWED_TOOL_ROUNDS = 20
 MAX_TOOL_CALLS_PER_ROUND = 6
+DEFAULT_SOFT_TIME_BUDGET_S = 330.0
 
 
 def _preview_args(args: object) -> str:
@@ -54,6 +55,7 @@ def main() -> int:
     parser.add_argument("--output-stats", required=True)
     parser.add_argument("--output-meta", default="")
     parser.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_TOOL_ROUNDS)
+    parser.add_argument("--soft-time-budget", type=float, default=DEFAULT_SOFT_TIME_BUDGET_S)
     args = parser.parse_args()
 
     max_rounds = max(1, min(args.max_rounds, MAX_ALLOWED_TOOL_ROUNDS))
@@ -63,89 +65,102 @@ def main() -> int:
         return 1
 
     repo_root = Path(args.repo_root).resolve()
-    user_content = Path(args.user_file).read_text(encoding="utf-8", errors="replace")
-
-    provider = create_provider(
-        provider_name=args.provider,
-        model=args.model,
-        api_key=api_key,
-        tool_specs=TOOL_SPECS,
-    )
-    provider.init_conversation(SYSTEM_PROMPT, user_content)
-
-    totals = TokenUsage()
-    api_calls = 0
-    tool_calls_count = 0
-    resolved_model = args.model or PROVIDERS[args.provider].default_model
-    final_content = ""
-    start_time = time.monotonic()
-
-    for round_idx in range(max_rounds + 1):
-        allow_tools = round_idx < max_rounds
-        if not allow_tools:
-            provider.append_final_nudge(FINAL_ROUND_NUDGE)
-
-        turn = provider.call_turn(allow_tools=allow_tools)
-        api_calls += 1
-        totals.add(turn.usage)
-        if turn.model:
-            resolved_model = turn.model
-
-        if allow_tools and turn.tool_calls:
-            results = []
-            for idx, call in enumerate(turn.tool_calls):
-                if idx >= MAX_TOOL_CALLS_PER_ROUND:
-                    results.append(
-                        (call, f"Skipped: max {MAX_TOOL_CALLS_PER_ROUND} tool calls per round.")
-                    )
-                    continue
-                tool_calls_count += 1
-                print(
-                    f"[round {round_idx + 1}] tool: {call.name}({_preview_args(call.args)})",
-                    file=sys.stderr,
-                )
-                output = execute_tool(repo_root, call.name, call.args)
-                results.append((call, output))
-            provider.append_tool_results(turn, results)
-            continue
-
-        final_content = sanitize_markdown(turn.text)
-        break
-
-    if not final_content:
-        print(f"Error: {args.provider} produced an empty final review.", file=sys.stderr)
+    if not repo_root.is_dir():
+        print(f"Error: --repo-root is not a directory: {repo_root}", file=sys.stderr)
         return 1
 
-    elapsed_s = time.monotonic() - start_time
-    help_wanted = detect_help_wanted(final_content)
-    stats_table = format_stats_table(
-        provider=args.provider,
-        model=resolved_model,
-        prompt_tokens=totals.prompt,
-        cache_hit_tokens=totals.cache_hit,
-        completion_tokens=totals.completion,
-        reasoning_tokens=totals.reasoning,
-        total_tokens=totals.total,
-        api_calls=api_calls,
-        tool_calls=tool_calls_count,
-        elapsed_s=elapsed_s,
-    )
+    try:
+        user_content = Path(args.user_file).read_text(encoding="utf-8", errors="replace")
 
-    review_md = (
-        f"{final_content}\n\n---\n"
-        "<details>\n"
-        "<summary>📊 Token Usage & Review Stats</summary>\n\n"
-        f"{stats_table}\n"
-        "</details>\n"
-    )
-
-    Path(args.output_review).write_text(review_md, encoding="utf-8")
-    Path(args.output_stats).write_text(stats_table, encoding="utf-8")
-    if args.output_meta:
-        Path(args.output_meta).write_text(
-            json.dumps({"help_wanted": help_wanted}) + "\n",
-            encoding="utf-8",
+        provider = create_provider(
+            provider_name=args.provider,
+            model=args.model,
+            api_key=api_key,
+            tool_specs=TOOL_SPECS,
         )
+        provider.init_conversation(SYSTEM_PROMPT, user_content)
+
+        totals = TokenUsage()
+        api_calls = 0
+        tool_calls_count = 0
+        resolved_model = args.model or PROVIDERS[args.provider].default_model
+        final_content = ""
+        start_time = time.monotonic()
+
+        for round_idx in range(max_rounds + 1):
+            allow_tools = (round_idx < max_rounds) and ((time.monotonic() - start_time) < args.soft_time_budget)
+            if not allow_tools:
+                provider.append_final_nudge(FINAL_ROUND_NUDGE)
+
+            turn = provider.call_turn(allow_tools=allow_tools)
+            api_calls += 1
+            totals.add(turn.usage)
+            if turn.model:
+                resolved_model = turn.model
+
+            if allow_tools and turn.tool_calls:
+                results = []
+                for idx, call in enumerate(turn.tool_calls):
+                    if idx >= MAX_TOOL_CALLS_PER_ROUND:
+                        results.append(
+                            (call, f"Skipped: max {MAX_TOOL_CALLS_PER_ROUND} tool calls per round.")
+                        )
+                        continue
+                    tool_calls_count += 1
+                    print(
+                        f"[round {round_idx + 1}] tool: {call.name}({_preview_args(call.args)})",
+                        file=sys.stderr,
+                    )
+                    output = execute_tool(repo_root, call.name, call.args)
+                    results.append((call, output))
+                provider.append_tool_results(turn, results)
+                continue
+
+            final_content = sanitize_markdown(turn.text)
+            break
+
+        if not final_content:
+            print(f"Error: {args.provider} produced an empty final review.", file=sys.stderr)
+            return 1
+
+        elapsed_s = time.monotonic() - start_time
+        help_wanted = detect_help_wanted(final_content)
+        stats_table = format_stats_table(
+            provider=args.provider,
+            model=resolved_model,
+            prompt_tokens=totals.prompt,
+            cache_hit_tokens=totals.cache_hit,
+            completion_tokens=totals.completion,
+            reasoning_tokens=totals.reasoning,
+            total_tokens=totals.total,
+            api_calls=api_calls,
+            tool_calls=tool_calls_count,
+            elapsed_s=elapsed_s,
+        )
+
+        stats_block = (
+            "\n\n---\n"
+            "<details>\n"
+            "<summary>📊 Token Usage & Review Stats</summary>\n\n"
+            f"{stats_table}\n"
+            "</details>\n"
+        )
+        max_body_chars = 65_000 - len(stats_block)
+        if len(final_content) > max_body_chars:
+            notice = "\n\n... [review truncated to fit GitHub comment limit]"
+            final_content = final_content[: max(0, max_body_chars - len(notice))] + notice
+        review_md = final_content + stats_block
+
+        Path(args.output_review).write_text(review_md, encoding="utf-8")
+        Path(args.output_stats).write_text(stats_table, encoding="utf-8")
+        if args.output_meta:
+            Path(args.output_meta).write_text(
+                json.dumps({"help_wanted": help_wanted}) + "\n",
+                encoding="utf-8",
+            )
+    except (RuntimeError, ValueError, OSError) as exc:
+        print(f"Error: {args.provider} review failed: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
