@@ -5,18 +5,27 @@ on:
   workflow_dispatch:
     inputs:
       provider:
-        description: 'AI provider to run the post-merge audit'
+        description: 'AI audit mode (single provider or blind parallel dual cross-audit)'
         required: false
         default: 'deepseek'
         type: choice
         options:
           - deepseek
           - gemini
+          - dual
       model:
-        description: 'Optional model override (defaults: deepseek-flash / gemini-4-neon)'
+        description: 'Optional model override for single-provider mode (ignored in dual mode)'
         required: false
         default: ''
         type: string
+      synthesizer:
+        description: 'Synthesizer provider for dual mode (ignored in single mode)'
+        required: false
+        default: 'gemini'
+        type: choice
+        options:
+          - gemini
+          - deepseek
       # TODO: Remove rewind_merges input once manual testing is complete
       rewind_merges:
         description: 'TEMPORARY (testing): rewind upstream-tracker by N merge commits (0-5)'
@@ -36,7 +45,7 @@ concurrency:
 jobs:
   sync-merges:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout fork
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,30 +66,35 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           AI_PROVIDER: ${{ inputs.provider || 'deepseek' }}
           AI_MODEL: ${{ inputs.model || '' }}
+          AI_SYNTHESIZER: ${{ inputs.synthesizer || 'gemini' }}
           # TODO: Remove REWIND_MERGES once manual testing is complete
           REWIND_MERGES: ${{ inputs.rewind_merges || '0' }}
           MAX_PRS_PER_RUN: 5
           MAX_DIFF_BYTES: 200000
+          MAX_DRAFT_BYTES: 60000
         run: |
-          # Strict allowlist validation for provider and optional model override
+          # Strict allowlist validation for provider, synthesizer, and optional model override
+          DEEPSEEK_DEFAULT_MODEL="deepseek-flash"
+          GEMINI_DEFAULT_MODEL="gemini-4-neon"
+
           case "$AI_PROVIDER" in
-            deepseek)
-              SELECTED_API_KEY="${DEEPSEEK_API_KEY:-}"
-              DEFAULT_MODEL="deepseek-flash"
-              ;;
-            gemini)
-              SELECTED_API_KEY="${GEMINI_API_KEY:-}"
-              DEFAULT_MODEL="gemini-4-neon"
-              ;;
+            deepseek|gemini|dual) ;;
             *)
               echo "Invalid AI_PROVIDER value: $AI_PROVIDER"
               exit 1
               ;;
           esac
 
-          EFFECTIVE_MODEL="${AI_MODEL:-$DEFAULT_MODEL}"
-          if [[ ! "$EFFECTIVE_MODEL" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-            echo "Invalid AI_MODEL value: $EFFECTIVE_MODEL"
+          case "$AI_SYNTHESIZER" in
+            gemini|deepseek) ;;
+            *)
+              echo "Invalid AI_SYNTHESIZER value: $AI_SYNTHESIZER"
+              exit 1
+              ;;
+          esac
+
+          if [ -n "$AI_MODEL" ] && [[ ! "$AI_MODEL" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            echo "Invalid AI_MODEL value: $AI_MODEL"
             exit 1
           fi
 
@@ -104,12 +118,79 @@ jobs:
               ORIG_TRACKER="$target_sha"
             fi
           }
-          mapfile -t COMMITS < <(git rev-list --first-parent --reverse "${LAST_SEEN}..upstream/master")
 
-          if [ "${#COMMITS[@]}" -eq 0 ]; then
-            echo "No new merges found."
-            exit 0
-          fi
+          escape_tags() {
+            LC_ALL=C sed -E 's#<(/?(commit_metadata|diff_stat|diff|audit_a|audit_b)\b)#\&lt;\1#gi'
+          }
+
+          # Isolated subshell helper: exposes ONLY the selected provider's API key via env (never argv)
+          run_reviewer() {
+            local provider="$1"
+            local model="$2"
+            local mode="$3"
+            local max_rounds="$4"
+            local soft_budget="$5"
+            local hard_timeout="$6"
+            local user_file="$7"
+            local out_review="$8"
+            local out_stats="$9"
+            local out_meta="${10}"
+            local out_usage="${11}"
+            local draft_flag="${12:-}"
+
+            local key=""
+            case "$provider" in
+              deepseek) key="${DEEPSEEK_API_KEY:-}" ;;
+              gemini) key="${GEMINI_API_KEY:-}" ;;
+              *) return 1 ;;
+            esac
+            [ -n "$key" ] || return 1
+
+            local extra_args=()
+            if [ -n "$out_stats" ]; then extra_args+=(--output-stats "$out_stats"); fi
+            if [ -n "$out_meta" ]; then extra_args+=(--output-meta "$out_meta"); fi
+            if [ -n "$out_usage" ]; then extra_args+=(--output-usage-json "$out_usage"); fi
+            if [ "$draft_flag" = "draft" ]; then extra_args+=(--draft-only); fi
+
+            (
+              export AI_API_KEY="$key"
+              unset GH_TOKEN GITHUB_TOKEN ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN RUNNER_TEMP DEEPSEEK_API_KEY GEMINI_API_KEY
+              exec timeout "$hard_timeout" python3 -I "${TMP_DIR}/scripts/review.py" \
+                --provider "$provider" \
+                --model "$model" \
+                --mode "$mode" \
+                --repo-root "$PWD" \
+                --max-rounds "$max_rounds" \
+                --soft-time-budget "$soft_budget" \
+                --user-file "$user_file" \
+                --output-review "$out_review" \
+                "${extra_args[@]}"
+            )
+          }
+
+          # Local Python finalizer (no secrets, no API calls): combines stats table + enforces 65k comment cap
+          finalize_review() {
+            local body_file="$1"
+            local out_review="$2"
+            local out_stats="$3"
+            local out_meta="$4"
+            local banner="$5"
+            shift 5
+            local usage_args=()
+            for entry in "$@"; do
+              usage_args+=(--usage-json "$entry")
+            done
+            (
+              unset GH_TOKEN GITHUB_TOKEN ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN RUNNER_TEMP DEEPSEEK_API_KEY GEMINI_API_KEY AI_API_KEY
+              exec python3 -I "${TMP_DIR}/scripts/review.py" \
+                --finalize-body "$body_file" \
+                --output-review "$out_review" \
+                --output-stats "$out_stats" \
+                --output-meta "$out_meta" \
+                --banner "$banner" \
+                "${usage_args[@]}"
+            )
+          }
 
           post_pr_comment() {
             local pr_url="$1"
@@ -126,6 +207,19 @@ jobs:
             echo "Warning: failed to post comment on $pr_url after 3 attempts."
             return 1
           }
+
+          close_unreviewed_pr() {
+            local pr_url="$1"
+            local base_branch="$2"
+            gh pr close "$pr_url" --repo "$GITHUB_REPOSITORY" --delete-branch || true
+            git push origin --delete "$base_branch" 2>/dev/null || true
+          }
+
+          mapfile -t COMMITS < <(git rev-list --first-parent --reverse "${LAST_SEEN}..upstream/master")
+          if [ "${#COMMITS[@]}" -eq 0 ]; then
+            echo "No new merges found."
+            exit 0
+          fi
 
           echo "## Bitcoin Core Merge Review Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -191,7 +285,13 @@ jobs:
 
             echo "Created PR: $PR_URL"
 
-            if [ -n "$SELECTED_API_KEY" ]; then
+            # Check whether at least one required API key is available for the selected mode
+            HAS_KEY=false
+            if [ "$AI_PROVIDER" = "deepseek" ] && [ -n "${DEEPSEEK_API_KEY:-}" ]; then HAS_KEY=true; fi
+            if [ "$AI_PROVIDER" = "gemini" ] && [ -n "${GEMINI_API_KEY:-}" ]; then HAS_KEY=true; fi
+            if [ "$AI_PROVIDER" = "dual" ] && { [ -n "${DEEPSEEK_API_KEY:-}" ] || [ -n "${GEMINI_API_KEY:-}" ]; }; then HAS_KEY=true; fi
+
+            if [ "$HAS_KEY" = true ]; then
               CHANGED_FILES=$(git diff --name-only "${SHA}^1..${SHA}")
               if grep -q '^src/' <<< "$CHANGED_FILES"; then
                 MAX_ROUNDS=12
@@ -199,7 +299,6 @@ jobs:
                 MAX_ROUNDS=8
               fi
 
-              echo "Running ${AI_PROVIDER} (${EFFECTIVE_MODEL}, max ${MAX_ROUNDS} rounds) agentic review for $SHORT_SHA..."
               git checkout --detach --force "$SHA"
               DIFF_STAT=$(git diff --stat "${SHA}^1..${SHA}" -- . ':!src/qt/locale/*.ts')
 
@@ -224,9 +323,6 @@ jobs:
                 fi
               fi
 
-              escape_tags() {
-                LC_ALL=C sed -E 's#<(/?(commit_metadata|diff_stat|diff)\b)#\&lt;\1#gi'
-              }
               {
                 printf '<commit_metadata>\nCommit: %s\nTitle: %s\n\nCommit message:\n%s\n</commit_metadata>\n\n' \
                   "$SHA" "$(printf '%s' "$TITLE" | escape_tags)" "$(printf '%s' "$BODY" | escape_tags)"
@@ -237,24 +333,114 @@ jobs:
               } > "$USER_FILE"
               rm -f "$DIFF_FILE"
 
-              # Isolated subshell: pass ONLY the active provider's key via env (never on argv) and strip all other secrets
-              if (
-                export AI_API_KEY="$SELECTED_API_KEY"
-                unset GH_TOKEN GITHUB_TOKEN ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN RUNNER_TEMP DEEPSEEK_API_KEY GEMINI_API_KEY
-                exec timeout 420 python3 -I "${TMP_DIR}/scripts/review.py" \
-                  --provider "$AI_PROVIDER" \
-                  --model "$EFFECTIVE_MODEL" \
-                  --repo-root "$PWD" \
-                  --max-rounds "$MAX_ROUNDS" \
-                  --user-file "$USER_FILE" \
-                  --output-review "$REVIEW_MD" \
-                  --output-stats "$STATS_MD" \
-                  --output-meta "$META_JSON"
-              ); then
+              REVIEW_OK=false
+              if [ "$AI_PROVIDER" != "dual" ]; then
+                if [ "$AI_PROVIDER" = "deepseek" ]; then
+                  EFFECTIVE_MODEL="${AI_MODEL:-$DEEPSEEK_DEFAULT_MODEL}"
+                else
+                  EFFECTIVE_MODEL="${AI_MODEL:-$GEMINI_DEFAULT_MODEL}"
+                fi
+                echo "Running ${AI_PROVIDER} (${EFFECTIVE_MODEL}, max ${MAX_ROUNDS} rounds) agentic review for $SHORT_SHA..."
+                if run_reviewer "$AI_PROVIDER" "$EFFECTIVE_MODEL" audit "$MAX_ROUNDS" 330 420 \
+                  "$USER_FILE" "$REVIEW_MD" "$STATS_MD" "$META_JSON" "" ""; then
+                  REVIEW_OK=true
+                fi
+              else
+                echo "Running blind dual cross-audit (deepseek + gemini, synthesizer=${AI_SYNTHESIZER}, max ${MAX_ROUNDS} rounds) for $SHORT_SHA..."
+                DRAFT_DS="${TMP_DIR}/draft-ds-${SHORT_SHA}.md"
+                USAGE_DS="${TMP_DIR}/usage-ds-${SHORT_SHA}.json"
+                DRAFT_GM="${TMP_DIR}/draft-gm-${SHORT_SHA}.md"
+                USAGE_GM="${TMP_DIR}/usage-gm-${SHORT_SHA}.json"
+                SYNTH_USER="${TMP_DIR}/synth-user-${SHORT_SHA}.txt"
+                DRAFT_SYNTH="${TMP_DIR}/draft-synth-${SHORT_SHA}.md"
+                USAGE_SYNTH="${TMP_DIR}/usage-synth-${SHORT_SHA}.json"
+
+                RC_DS=1
+                RC_GM=1
+                PID_DS=""
+                PID_GM=""
+
+                if [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+                  run_reviewer deepseek "$DEEPSEEK_DEFAULT_MODEL" audit "$MAX_ROUNDS" 330 420 \
+                    "$USER_FILE" "$DRAFT_DS" "" "" "$USAGE_DS" draft &
+                  PID_DS=$!
+                else
+                  echo "Warning: DEEPSEEK_API_KEY not set in dual mode; skipping DeepSeek blind audit."
+                fi
+
+                if [ -n "${GEMINI_API_KEY:-}" ]; then
+                  run_reviewer gemini "$GEMINI_DEFAULT_MODEL" audit "$MAX_ROUNDS" 330 420 \
+                    "$USER_FILE" "$DRAFT_GM" "" "" "$USAGE_GM" draft &
+                  PID_GM=$!
+                else
+                  echo "Warning: GEMINI_API_KEY not set in dual mode; skipping Gemini blind audit."
+                fi
+
+                if [ -n "$PID_DS" ]; then
+                  RC_DS=0; wait "$PID_DS" || RC_DS=$?
+                fi
+                if [ -n "$PID_GM" ]; then
+                  RC_GM=0; wait "$PID_GM" || RC_GM=$?
+                fi
+
+                if [ "$RC_DS" -eq 0 ] && [ "$RC_GM" -eq 0 ]; then
+                  echo "Both blind audits succeeded; running ${AI_SYNTHESIZER} synthesizer..."
+                  if [ "$AI_SYNTHESIZER" = "deepseek" ]; then
+                    SYNTH_MODEL="$DEEPSEEK_DEFAULT_MODEL"
+                  else
+                    SYNTH_MODEL="$GEMINI_DEFAULT_MODEL"
+                  fi
+
+                  {
+                    cat "$USER_FILE"
+                    printf '\n<audit_a provider="deepseek" model="%s">\n' "$DEEPSEEK_DEFAULT_MODEL"
+                    (set +o pipefail; head -c "$MAX_DRAFT_BYTES" "$DRAFT_DS" | escape_tags)
+                    printf '\n</audit_a>\n\n<audit_b provider="gemini" model="%s">\n' "$GEMINI_DEFAULT_MODEL"
+                    (set +o pipefail; head -c "$MAX_DRAFT_BYTES" "$DRAFT_GM" | escape_tags)
+                    printf '\n</audit_b>\n'
+                  } > "$SYNTH_USER"
+
+                  if run_reviewer "$AI_SYNTHESIZER" "$SYNTH_MODEL" synthesize 6 180 240 \
+                    "$SYNTH_USER" "$DRAFT_SYNTH" "" "" "$USAGE_SYNTH" draft; then
+                    if finalize_review "$DRAFT_SYNTH" "$REVIEW_MD" "$STATS_MD" "$META_JSON" "" \
+                      "Audit A:${USAGE_DS}" "Audit B:${USAGE_GM}" "Synthesis:${USAGE_SYNTH}"; then
+                      REVIEW_OK=true
+                    fi
+                  else
+                    echo "Warning: ${AI_SYNTHESIZER} synthesizer failed; falling back to surviving blind audit."
+                    if [ "$AI_SYNTHESIZER" = "gemini" ]; then
+                      FALLBACK_BANNER="> ⚠️ _Dual-audit fallback: \`gemini\` synthesizer failed; showing completed blind audit from \`deepseek\` (\`${DEEPSEEK_DEFAULT_MODEL}\`)._"
+                      if finalize_review "$DRAFT_DS" "$REVIEW_MD" "$STATS_MD" "$META_JSON" "$FALLBACK_BANNER" "Audit A:${USAGE_DS}"; then
+                        REVIEW_OK=true
+                      fi
+                    else
+                      FALLBACK_BANNER="> ⚠️ _Dual-audit fallback: \`deepseek\` synthesizer failed; showing completed blind audit from \`gemini\` (\`${GEMINI_DEFAULT_MODEL}\`)._"
+                      if finalize_review "$DRAFT_GM" "$REVIEW_MD" "$STATS_MD" "$META_JSON" "$FALLBACK_BANNER" "Audit B:${USAGE_GM}"; then
+                        REVIEW_OK=true
+                      fi
+                    fi
+                  fi
+                elif [ "$RC_DS" -eq 0 ]; then
+                  echo "Warning: Gemini blind audit unavailable/failed; falling back to DeepSeek single-model audit."
+                  FALLBACK_BANNER="> ⚠️ _Dual-audit fallback: \`gemini\` was unavailable; showing single-model audit from \`deepseek\` (\`${DEEPSEEK_DEFAULT_MODEL}\`)._"
+                  if finalize_review "$DRAFT_DS" "$REVIEW_MD" "$STATS_MD" "$META_JSON" "$FALLBACK_BANNER" "Audit A:${USAGE_DS}"; then
+                    REVIEW_OK=true
+                  fi
+                elif [ "$RC_GM" -eq 0 ]; then
+                  echo "Warning: DeepSeek blind audit unavailable/failed; falling back to Gemini single-model audit."
+                  FALLBACK_BANNER="> ⚠️ _Dual-audit fallback: \`deepseek\` was unavailable; showing single-model audit from \`gemini\` (\`${GEMINI_DEFAULT_MODEL}\`)._"
+                  if finalize_review "$DRAFT_GM" "$REVIEW_MD" "$STATS_MD" "$META_JSON" "$FALLBACK_BANNER" "Audit B:${USAGE_GM}"; then
+                    REVIEW_OK=true
+                  fi
+                fi
+
+                rm -f "$DRAFT_DS" "$USAGE_DS" "$DRAFT_GM" "$USAGE_GM" "$SYNTH_USER" "$DRAFT_SYNTH" "$USAGE_SYNTH"
+              fi
+
+              if [ "$REVIEW_OK" = true ]; then
                 if ! post_pr_comment "$PR_URL" "$REVIEW_MD"; then
                   echo "Error: failed to post review comment on $PR_URL; closing unreviewed PR so next run retries."
-                  gh pr close "$PR_URL" --repo "$GITHUB_REPOSITORY" --delete-branch || true
-                  git push origin --delete "$BASE_BRANCH" 2>/dev/null || true
+                  close_unreviewed_pr "$PR_URL" "$BASE_BRANCH"
                   rm -f "$USER_FILE" "$REVIEW_MD" "$STATS_MD" "$META_JSON"
                   exit 1
                 fi
@@ -281,8 +467,7 @@ jobs:
                 } >> "$GITHUB_STEP_SUMMARY"
               else
                 echo "Error: ${AI_PROVIDER} review failed or timed out for $SHORT_SHA; closing unreviewed PR so next run retries."
-                gh pr close "$PR_URL" --repo "$GITHUB_REPOSITORY" --delete-branch || true
-                git push origin --delete "$BASE_BRANCH" 2>/dev/null || true
+                close_unreviewed_pr "$PR_URL" "$BASE_BRANCH"
                 rm -f "$USER_FILE" "$REVIEW_MD" "$STATS_MD" "$META_JSON"
                 exit 1
               fi
