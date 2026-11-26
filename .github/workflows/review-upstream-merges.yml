@@ -45,7 +45,7 @@ concurrency:
 jobs:
   sync-merges:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - name: Checkout fork
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -294,9 +294,11 @@ jobs:
             if [ "$HAS_KEY" = true ]; then
               CHANGED_FILES=$(git diff --name-only "${SHA}^1..${SHA}")
               if grep -q '^src/' <<< "$CHANGED_FILES"; then
-                MAX_ROUNDS=12
+                MAX_ROUNDS=16
+                SYNTH_MAX_ROUNDS=10
               else
-                MAX_ROUNDS=8
+                MAX_ROUNDS=10
+                SYNTH_MAX_ROUNDS=8
               fi
 
               git checkout --detach --force "$SHA"
@@ -346,7 +348,7 @@ jobs:
                   REVIEW_OK=true
                 fi
               else
-                echo "Running blind dual cross-audit (deepseek + gemini, synthesizer=${AI_SYNTHESIZER}, max ${MAX_ROUNDS} rounds) for $SHORT_SHA..."
+                echo "Running blind dual cross-audit (deepseek + gemini, synthesizer=${AI_SYNTHESIZER}, max ${MAX_ROUNDS} audit / ${SYNTH_MAX_ROUNDS} synth rounds) for $SHORT_SHA..."
                 DRAFT_DS="${TMP_DIR}/draft-ds-${SHORT_SHA}.md"
                 USAGE_DS="${TMP_DIR}/usage-ds-${SHORT_SHA}.json"
                 DRAFT_GM="${TMP_DIR}/draft-gm-${SHORT_SHA}.md"
@@ -400,7 +402,7 @@ jobs:
                     printf '\n</audit_b>\n'
                   } > "$SYNTH_USER"
 
-                  if run_reviewer "$AI_SYNTHESIZER" "$SYNTH_MODEL" synthesize 6 180 240 \
+                  if run_reviewer "$AI_SYNTHESIZER" "$SYNTH_MODEL" synthesize "$SYNTH_MAX_ROUNDS" 240 300 \
                     "$SYNTH_USER" "$DRAFT_SYNTH" "" "" "$USAGE_SYNTH" draft; then
                     if finalize_review "$DRAFT_SYNTH" "$REVIEW_MD" "$STATS_MD" "$META_JSON" "" \
                       "Audit A:${USAGE_DS}" "Audit B:${USAGE_GM}" "Synthesis:${USAGE_SYNTH}"; then

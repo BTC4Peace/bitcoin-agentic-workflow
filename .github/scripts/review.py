@@ -33,9 +33,9 @@ from reviewer.providers import PROVIDERS, create_provider
 from reviewer.providers.base import TokenUsage
 from reviewer.tools import TOOL_SPECS, execute_tool
 
-DEFAULT_MAX_TOOL_ROUNDS = 8
+DEFAULT_MAX_TOOL_ROUNDS = 10
 MAX_ALLOWED_TOOL_ROUNDS = 20
-MAX_TOOL_CALLS_PER_ROUND = 6
+MAX_TOOL_CALLS_PER_ROUND = 10
 DEFAULT_SOFT_TIME_BUDGET_S = 330.0
 MAX_GITHUB_COMMENT_CHARS = 65_000
 
@@ -160,8 +160,20 @@ def main() -> int:
         start_time = time.monotonic()
 
         for round_idx in range(max_rounds + 1):
-            allow_tools = (round_idx < max_rounds) and ((time.monotonic() - start_time) < args.soft_time_budget)
+            elapsed_now = time.monotonic() - start_time
+            hit_round_cap = round_idx >= max_rounds
+            hit_time_cap = elapsed_now >= args.soft_time_budget
+            allow_tools = (not hit_round_cap) and (not hit_time_cap)
             if not allow_tools:
+                reason = (
+                    f"soft time budget ({elapsed_now:.1f}s >= {args.soft_time_budget:.0f}s)"
+                    if hit_time_cap
+                    else f"max_rounds ({max_rounds})"
+                )
+                print(
+                    f"[{args.provider}:{args.mode} round {round_idx + 1}] reached {reason}; forcing final audit write.",
+                    file=sys.stderr,
+                )
                 provider.append_final_nudge(FINAL_ROUND_NUDGE)
 
             turn = provider.call_turn(allow_tools=allow_tools)
@@ -172,8 +184,10 @@ def main() -> int:
 
             if allow_tools and turn.tool_calls:
                 results = []
+                skipped_count = 0
                 for idx, call in enumerate(turn.tool_calls):
                     if idx >= MAX_TOOL_CALLS_PER_ROUND:
+                        skipped_count += 1
                         results.append(
                             (call, f"Skipped: max {MAX_TOOL_CALLS_PER_ROUND} tool calls per round.")
                         )
@@ -185,6 +199,11 @@ def main() -> int:
                     )
                     output = execute_tool(repo_root, call.name, call.args)
                     results.append((call, output))
+                if skipped_count:
+                    print(
+                        f"[{args.provider}:{args.mode} round {round_idx + 1}] skipped {skipped_count} excess tool call(s) (cap {MAX_TOOL_CALLS_PER_ROUND}/round).",
+                        file=sys.stderr,
+                    )
                 provider.append_tool_results(turn, results)
                 continue
 
