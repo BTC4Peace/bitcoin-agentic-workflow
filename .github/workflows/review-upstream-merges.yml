@@ -215,6 +215,69 @@ jobs:
             git push origin --delete "$base_branch" 2>/dev/null || true
           }
 
+          copy_upstream_labels() {
+            local pr_url="$1"
+            local sha="$2"
+            local title="$3"
+
+            local pr_num="${pr_url##*/}"
+            if [[ ! "$pr_num" =~ ^[0-9]+$ ]]; then
+              return 0
+            fi
+
+            local upstream_pr=""
+            if [[ "$title" =~ ^Merge[[:space:]]+(bitcoin/bitcoin)?#([0-9]+)([^0-9]|$) ]]; then
+              upstream_pr="${BASH_REMATCH[2]}"
+            else
+              upstream_pr=$(gh api "repos/bitcoin/bitcoin/commits/${sha}/pulls" \
+                --jq '[.[] | select(.base.repo.full_name == "bitcoin/bitcoin")][0].number // empty' \
+                2>/dev/null || true)
+            fi
+            if [[ ! "$upstream_pr" =~ ^[0-9]+$ ]]; then
+              return 0
+            fi
+
+            local labels_json=""
+            labels_json=$(gh api "repos/bitcoin/bitcoin/issues/${upstream_pr}" \
+              --jq '[.labels[]?
+                | select((.name // "") | (type == "string") and (length > 0))
+                | select((.name | ascii_downcase) != "help wanted")
+                | select((.name | ascii_downcase | test("^needs[ -]+backport")) | not)
+                | {
+                    name: .name,
+                    color: (if ((.color // "") | test("^[0-9a-fA-F]{6}$")) then .color else "ededed" end),
+                    description: ((.description // "") | tostring | .[0:100])
+                  }]' \
+              2>/dev/null || true)
+
+            if [ -z "$labels_json" ]; then
+              return 0
+            fi
+
+            local label_count=""
+            label_count=$(printf '%s\n' "$labels_json" | jq -r 'length' 2>/dev/null || echo 0)
+            if [[ ! "$label_count" =~ ^[0-9]+$ ]] || [ "$label_count" -eq 0 ]; then
+              return 0
+            fi
+
+            # Ensure each upstream label exists on this fork with matching color/description (JSON input avoids flag injection)
+            local label_obj=""
+            while IFS= read -r label_obj; do
+              [ -n "$label_obj" ] || continue
+              printf '%s\n' "$label_obj" | gh api -X POST "repos/${GITHUB_REPOSITORY}/labels" --input - >/dev/null 2>&1 || true
+            done < <(printf '%s\n' "$labels_json" | jq -c '.[]')
+
+            local label_names_json=""
+            label_names_json=$(printf '%s\n' "$labels_json" | jq -c '{labels: [.[].name]}')
+            if printf '%s\n' "$label_names_json" | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${pr_num}/labels" --input - >/dev/null 2>&1; then
+              local label_list=""
+              label_list=$(printf '%s\n' "$labels_json" | jq -r '[.[].name] | join(", ")')
+              echo "Copied upstream PR #${upstream_pr} labels: ${label_list}"
+            else
+              echo "Warning: failed to attach upstream labels from #${upstream_pr} to PR #${pr_num}."
+            fi
+          }
+
           mapfile -t COMMITS < <(git rev-list --first-parent --reverse "${LAST_SEEN}..upstream/master")
           if [ "${#COMMITS[@]}" -eq 0 ]; then
             echo "No new merges found."
@@ -284,6 +347,7 @@ jobs:
             fi
 
             echo "Created PR: $PR_URL"
+            copy_upstream_labels "$PR_URL" "$SHA" "$TITLE" || true
 
             # Check whether at least one required API key is available for the selected mode
             HAS_KEY=false
