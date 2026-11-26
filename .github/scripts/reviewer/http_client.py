@@ -11,7 +11,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-HTTP_TIMEOUT_SECONDS = 180
+HTTP_TIMEOUT_SECONDS = 120
 MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_RETRY_AFTER_SECONDS = 30
 
