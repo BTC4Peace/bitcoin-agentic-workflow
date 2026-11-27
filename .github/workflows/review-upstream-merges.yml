@@ -61,19 +61,6 @@ jobs:
           fi
 
           CREATED_COUNT=0
-          write_outputs() {
-            if [ -n "${GITHUB_OUTPUT:-}" ]; then
-              {
-                echo "created_count=${CREATED_COUNT}"
-                if [ "$CREATED_COUNT" -gt 0 ]; then
-                  echo "has_created=true"
-                else
-                  echo "has_created=false"
-                fi
-              } >> "$GITHUB_OUTPUT"
-            fi
-          }
-          trap write_outputs EXIT
 
           ORIG_TRACKER=$(git rev-parse "origin/upstream-tracker")
           LAST_SEEN=$(git rev-parse "${ORIG_TRACKER}~${REWIND_MERGES}")
@@ -280,70 +267,3 @@ jobs:
             advance_tracker "$SHA"
             CREATED_COUNT=$((CREATED_COUNT + 1))
           done
-
-      - name: Send ntfy wake-up signal
-        if: (success() || failure()) && steps.create_prs.outputs.created_count != '' && steps.create_prs.outputs.created_count != '0'
-        env:
-          NTFY_URL: ${{ secrets.NTFY_URL || vars.NTFY_URL }}
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || vars.NTFY_TOPIC }}
-          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
-        run: |
-          ntfy_url="${NTFY_URL:-}"
-          ntfy_topic="${NTFY_TOPIC:-}"
-          ntfy_token="${NTFY_TOKEN:-}"
-
-          if [ -z "$ntfy_url" ] || [ -z "$ntfy_topic" ]; then
-            echo "::warning::ntfy wake-up skipped (NTFY_URL or NTFY_TOPIC not configured)."
-            exit 0
-          fi
-
-          if [[ "$ntfy_url" == *'"'* || "$ntfy_url" == *'\'* || "$ntfy_url" =~ [[:space:][:cntrl:]] ]]; then
-            echo "::warning::ntfy wake-up skipped (NTFY_URL contains invalid characters)."
-            exit 0
-          fi
-
-          while [[ "$ntfy_url" == */ ]]; do
-            ntfy_url="${ntfy_url%/}"
-          done
-
-          url_re='^https://[^/]+(/.*)?$'
-          if [[ ! "$ntfy_url" =~ $url_re ]]; then
-            echo "::warning::ntfy wake-up skipped (NTFY_URL must be a valid https:// URL)."
-            exit 0
-          fi
-
-          ntfy_topic="${ntfy_topic#/}"
-          ntfy_topic="${ntfy_topic%/}"
-          topic_re='^[A-Za-z0-9._~-]+$'
-          if [[ ! "$ntfy_topic" =~ $topic_re ]]; then
-            echo "::warning::ntfy wake-up skipped (NTFY_TOPIC contains invalid characters or is empty)."
-            exit 0
-          fi
-
-          if [ -n "$ntfy_token" ]; then
-            if [[ "$ntfy_token" == *'"'* || "$ntfy_token" == *'\'* || "$ntfy_token" =~ [[:cntrl:]] ]]; then
-              echo "::warning::ntfy wake-up skipped (NTFY_TOKEN contains invalid characters)."
-              exit 0
-            fi
-          fi
-
-          target_url="${ntfy_url}/${ntfy_topic}"
-          curl_rc=0
-          http_code=$(
-            {
-              printf 'url = "%s"\n' "$target_url"
-              if [ -n "$ntfy_token" ]; then
-                printf 'header = "Authorization: Bearer %s"\n' "$ntfy_token"
-              fi
-            } | curl -s --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 15 \
-              -X POST -H "Content-Length: 0" \
-              -o /dev/null -w '%{http_code}' \
-              -K - 2>/dev/null
-          ) || curl_rc=$?
-          http_code="${http_code:-000}"
-
-          if [ "$curl_rc" -ne 0 ] || [[ ! "$http_code" =~ ^2[0-9]{2}$ ]]; then
-            echo "::warning::ntfy wake-up POST failed (exit=${curl_rc}, http=${http_code}); review PRs remain queued."
-            exit 0
-          fi
-          echo "Sent contentless ntfy wake-up signal (http=${http_code})."
