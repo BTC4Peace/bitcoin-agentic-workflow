@@ -4,28 +4,6 @@ on:
   # TODO: Re-enable daily schedule (cron: '0 0 * * *') once manual testing is complete
   workflow_dispatch:
     inputs:
-      provider:
-        description: 'AI audit mode (single provider or blind parallel dual cross-audit)'
-        required: false
-        default: 'deepseek'
-        type: choice
-        options:
-          - deepseek
-          - gemini
-          - dual
-      model:
-        description: 'Optional model override for single-provider mode (ignored in dual mode)'
-        required: false
-        default: ''
-        type: string
-      synthesizer:
-        description: 'Synthesizer provider for dual mode (ignored in single mode)'
-        required: false
-        default: 'gemini'
-        type: choice
-        options:
-          - gemini
-          - deepseek
       # TODO: Remove rewind_merges input once manual testing is complete
       rewind_merges:
         description: 'TEMPORARY (testing): rewind upstream-tracker by N merge commits (0-5)'
@@ -45,7 +23,7 @@ concurrency:
 jobs:
   sync-merges:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 15
     steps:
       - name: Checkout fork
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,56 +36,44 @@ jobs:
           git fetch upstream master
           git fetch origin upstream-tracker
 
-      - name: Open isolated review PR and run agentic post-merge audit for each new merge commit
+      - name: Open isolated review PRs for new upstream merges
+        id: create_prs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          AI_PROVIDER: ${{ inputs.provider || 'deepseek' }}
-          AI_MODEL: ${{ inputs.model || '' }}
-          AI_SYNTHESIZER: ${{ inputs.synthesizer || 'gemini' }}
           # TODO: Remove REWIND_MERGES once manual testing is complete
           REWIND_MERGES: ${{ inputs.rewind_merges || '0' }}
           MAX_PRS_PER_RUN: 5
-          MAX_DIFF_BYTES: 200000
-          MAX_DRAFT_BYTES: 60000
+          QUEUE_LABEL: ${{ vars.QUEUE_LABEL || 'needs-audit' }}
         run: |
-          # Strict allowlist validation for provider, synthesizer, and optional model override
-          DEEPSEEK_DEFAULT_MODEL="deepseek-flash"
-          GEMINI_DEFAULT_MODEL="gemini-4-neon"
-
-          case "$AI_PROVIDER" in
-            deepseek|gemini|dual) ;;
-            *)
-              echo "Invalid AI_PROVIDER value: $AI_PROVIDER"
-              exit 1
-              ;;
-          esac
-
-          case "$AI_SYNTHESIZER" in
-            gemini|deepseek) ;;
-            *)
-              echo "Invalid AI_SYNTHESIZER value: $AI_SYNTHESIZER"
-              exit 1
-              ;;
-          esac
-
-          if [ -n "$AI_MODEL" ] && [[ ! "$AI_MODEL" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-            echo "Invalid AI_MODEL value: $AI_MODEL"
-            exit 1
-          fi
-
           # TODO: Remove REWIND_MERGES handling once manual testing is complete
           if [[ ! "$REWIND_MERGES" =~ ^[0-5]$ ]]; then
             echo "Invalid REWIND_MERGES value (must be 0-5): $REWIND_MERGES"
             exit 1
           fi
 
-          # Private 0700 temp directory; copy trusted reviewer package from master before checking out upstream commits
-          TMP_DIR=$(mktemp -d)
-          trap 'rm -rf "$TMP_DIR"' EXIT
-          cp -R .github/scripts "${TMP_DIR}/scripts"
+          if [ -z "${QUEUE_LABEL:-}" ]; then
+            QUEUE_LABEL="needs-audit"
+          fi
+          if [[ "$QUEUE_LABEL" =~ [[:cntrl:]] ]] || [[ "$QUEUE_LABEL" =~ ^[[:space:]]*$ ]]; then
+            echo "Invalid QUEUE_LABEL value."
+            exit 1
+          fi
+
+          CREATED_COUNT=0
+          write_outputs() {
+            if [ -n "${GITHUB_OUTPUT:-}" ]; then
+              {
+                echo "created_count=${CREATED_COUNT}"
+                if [ "$CREATED_COUNT" -gt 0 ]; then
+                  echo "has_created=true"
+                else
+                  echo "has_created=false"
+                fi
+              } >> "$GITHUB_OUTPUT"
+            fi
+          }
+          trap write_outputs EXIT
 
           ORIG_TRACKER=$(git rev-parse "origin/upstream-tracker")
           LAST_SEEN=$(git rev-parse "${ORIG_TRACKER}~${REWIND_MERGES}")
@@ -119,100 +85,26 @@ jobs:
             fi
           }
 
-          escape_tags() {
-            LC_ALL=C sed -E 's#<(/?(commit_metadata|diff_stat|diff|audit_a|audit_b)\b)#\&lt;\1#gi'
-          }
+          ensure_repo_label() {
+            local label_json="$1"
+            local label_name=""
+            label_name=$(printf '%s\n' "$label_json" | jq -r '.name')
+            [ -n "$label_name" ] || return 1
 
-          # Isolated subshell helper: exposes ONLY the selected provider's API key via env (never argv)
-          run_reviewer() {
-            local provider="$1"
-            local model="$2"
-            local mode="$3"
-            local max_rounds="$4"
-            local soft_budget="$5"
-            local hard_timeout="$6"
-            local user_file="$7"
-            local out_review="$8"
-            local out_stats="$9"
-            local out_meta="${10}"
-            local out_usage="${11}"
-            local draft_flag="${12:-}"
+            local encoded_name=""
+            encoded_name=$(jq -rn --arg l "$label_name" '$l|@uri')
+            if gh api "repos/${GITHUB_REPOSITORY}/labels/${encoded_name}" >/dev/null 2>&1; then
+              return 0
+            fi
 
-            local key=""
-            case "$provider" in
-              deepseek) key="${DEEPSEEK_API_KEY:-}" ;;
-              gemini) key="${GEMINI_API_KEY:-}" ;;
-              *) return 1 ;;
-            esac
-            [ -n "$key" ] || return 1
-
-            local extra_args=()
-            if [ -n "$out_stats" ]; then extra_args+=(--output-stats "$out_stats"); fi
-            if [ -n "$out_meta" ]; then extra_args+=(--output-meta "$out_meta"); fi
-            if [ -n "$out_usage" ]; then extra_args+=(--output-usage-json "$out_usage"); fi
-            if [ "$draft_flag" = "draft" ]; then extra_args+=(--draft-only); fi
-
-            (
-              export AI_API_KEY="$key"
-              unset GH_TOKEN GITHUB_TOKEN ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN RUNNER_TEMP DEEPSEEK_API_KEY GEMINI_API_KEY
-              exec timeout "$hard_timeout" python3 -I "${TMP_DIR}/scripts/review.py" \
-                --provider "$provider" \
-                --model "$model" \
-                --mode "$mode" \
-                --repo-root "$PWD" \
-                --max-rounds "$max_rounds" \
-                --soft-time-budget "$soft_budget" \
-                --user-file "$user_file" \
-                --output-review "$out_review" \
-                "${extra_args[@]}"
-            )
-          }
-
-          # Local Python finalizer (no secrets, no API calls): combines stats table + enforces 65k comment cap
-          finalize_review() {
-            local body_file="$1"
-            local out_review="$2"
-            local out_stats="$3"
-            local out_meta="$4"
-            local banner="$5"
-            shift 5
-            local usage_args=()
-            for entry in "$@"; do
-              usage_args+=(--usage-json "$entry")
-            done
-            (
-              unset GH_TOKEN GITHUB_TOKEN ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN RUNNER_TEMP DEEPSEEK_API_KEY GEMINI_API_KEY AI_API_KEY
-              exec python3 -I "${TMP_DIR}/scripts/review.py" \
-                --finalize-body "$body_file" \
-                --output-review "$out_review" \
-                --output-stats "$out_stats" \
-                --output-meta "$out_meta" \
-                --banner "$banner" \
-                "${usage_args[@]}"
-            )
-          }
-
-          post_pr_comment() {
-            local pr_url="$1"
-            local body_file="$2"
-            for ATTEMPT in 1 2 3; do
-              if gh pr comment "$pr_url" \
-                --repo "$GITHUB_REPOSITORY" \
-                --body-file "$body_file"; then
+            local err_out=""
+            if ! err_out=$(printf '%s\n' "$label_json" | gh api --method POST "repos/${GITHUB_REPOSITORY}/labels" --input - 2>&1 >/dev/null); then
+              if grep -qE '422|already_exists' <<< "$err_out"; then
                 return 0
               fi
-              echo "gh pr comment failed (attempt ${ATTEMPT}/3); retrying in $((ATTEMPT * 5))s..."
-              sleep $((ATTEMPT * 5))
-            done
-            echo "Warning: failed to post comment on $pr_url after 3 attempts."
-            return 1
-          }
-
-          close_unreviewed_pr() {
-            local pr_url="$1"
-            local base_branch="$2"
-            gh pr close "$pr_url" --repo "$GITHUB_REPOSITORY" --delete-branch || true
-            git push origin --delete "$base_branch" 2>/dev/null || true
+              echo "Warning: failed to ensure label '${label_name}': ${err_out}"
+              return 1
+            fi
           }
 
           copy_upstream_labels() {
@@ -264,12 +156,12 @@ jobs:
             local label_obj=""
             while IFS= read -r label_obj; do
               [ -n "$label_obj" ] || continue
-              printf '%s\n' "$label_obj" | gh api -X POST "repos/${GITHUB_REPOSITORY}/labels" --input - >/dev/null 2>&1 || true
+              ensure_repo_label "$label_obj" || true
             done < <(printf '%s\n' "$labels_json" | jq -c '.[]')
 
             local label_names_json=""
             label_names_json=$(printf '%s\n' "$labels_json" | jq -c '{labels: [.[].name]}')
-            if printf '%s\n' "$label_names_json" | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${pr_num}/labels" --input - >/dev/null 2>&1; then
+            if printf '%s\n' "$label_names_json" | gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr_num}/labels" --input - >/dev/null 2>&1; then
               local label_list=""
               label_list=$(printf '%s\n' "$labels_json" | jq -r '[.[].name] | join(", ")')
               echo "Copied upstream PR #${upstream_pr} labels: ${label_list}"
@@ -278,18 +170,48 @@ jobs:
             fi
           }
 
+          ensure_queue_label() {
+            local queue_label="$1"
+            local label_json=""
+            label_json=$(jq -nc --arg name "$queue_label" '{name: $name, color: "fbca04", description: "Queued for local code audit"}')
+            ensure_repo_label "$label_json" || true
+          }
+
+          attach_queue_label() {
+            local pr_url="$1"
+            local queue_label="$2"
+            local pr_num="${pr_url##*/}"
+            if [[ ! "$pr_num" =~ ^[0-9]+$ ]]; then
+              echo "Error: invalid PR number extracted from URL '$pr_url'."
+              return 1
+            fi
+
+            local payload=""
+            payload=$(jq -nc --arg q "$queue_label" '{labels: [$q]}')
+            for ATTEMPT in 1 2 3; do
+              if printf '%s\n' "$payload" | gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr_num}/labels" --input - >/dev/null; then
+                return 0
+              fi
+              echo "Failed to attach queue label '${queue_label}' to PR #${pr_num} (attempt ${ATTEMPT}/3); retrying in $((ATTEMPT * 5))s..."
+              sleep $((ATTEMPT * 5))
+            done
+            echo "Error: failed to attach queue label '${queue_label}' to PR #${pr_num} after 3 attempts."
+            return 1
+          }
+
           mapfile -t COMMITS < <(git rev-list --first-parent --reverse "${LAST_SEEN}..upstream/master")
           if [ "${#COMMITS[@]}" -eq 0 ]; then
             echo "No new merges found."
             exit 0
           fi
 
-          echo "## Bitcoin Core Merge Review Summary" >> "$GITHUB_STEP_SUMMARY"
+          ensure_queue_label "$QUEUE_LABEL"
+
+          echo "## Bitcoin Core Merge Review Queue Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          COUNT=0
           for SHA in "${COMMITS[@]}"; do
-            if [ "$COUNT" -ge "$MAX_PRS_PER_RUN" ]; then
+            if [ "$CREATED_COUNT" -ge "$MAX_PRS_PER_RUN" ]; then
               break
             fi
 
@@ -348,201 +270,80 @@ jobs:
 
             echo "Created PR: $PR_URL"
             copy_upstream_labels "$PR_URL" "$SHA" "$TITLE" || true
-
-            # Check whether at least one required API key is available for the selected mode
-            HAS_KEY=false
-            if [ "$AI_PROVIDER" = "deepseek" ] && [ -n "${DEEPSEEK_API_KEY:-}" ]; then HAS_KEY=true; fi
-            if [ "$AI_PROVIDER" = "gemini" ] && [ -n "${GEMINI_API_KEY:-}" ]; then HAS_KEY=true; fi
-            if [ "$AI_PROVIDER" = "dual" ] && { [ -n "${DEEPSEEK_API_KEY:-}" ] || [ -n "${GEMINI_API_KEY:-}" ]; }; then HAS_KEY=true; fi
-
-            if [ "$HAS_KEY" = true ]; then
-              CHANGED_FILES=$(git diff --name-only "${SHA}^1..${SHA}")
-              if grep -q '^src/' <<< "$CHANGED_FILES"; then
-                MAX_ROUNDS=16
-                SYNTH_MAX_ROUNDS=10
-              else
-                MAX_ROUNDS=10
-                SYNTH_MAX_ROUNDS=8
-              fi
-
-              git checkout --detach --force "$SHA"
-              DIFF_STAT=$(git diff --stat "${SHA}^1..${SHA}" -- . ':!src/qt/locale/*.ts')
-
-              DIFF_FILE="${TMP_DIR}/diff-${SHORT_SHA}.patch"
-              USER_FILE="${TMP_DIR}/user-${SHORT_SHA}.txt"
-              REVIEW_MD="${TMP_DIR}/review-${SHORT_SHA}.md"
-              STATS_MD="${TMP_DIR}/stats-${SHORT_SHA}.md"
-              META_JSON="${TMP_DIR}/meta-${SHORT_SHA}.json"
-
-              git diff -W "${SHA}^1..${SHA}" -- . ':!src/qt/locale/*.ts' > "$DIFF_FILE"
-              DIFF_SIZE=$(wc -c < "$DIFF_FILE")
-              if [ "$DIFF_SIZE" -le "$MAX_DIFF_BYTES" ]; then
-                DIFF_MODE="full function context (-W), complete"
-              else
-                echo "Full function diff (${DIFF_SIZE} bytes) exceeds ${MAX_DIFF_BYTES} bytes; falling back to compact unified diff (-U3) to cover all changed files."
-                git diff -U3 "${SHA}^1..${SHA}" -- . ':!src/qt/locale/*.ts' > "$DIFF_FILE"
-                DIFF_SIZE=$(wc -c < "$DIFF_FILE")
-                if [ "$DIFF_SIZE" -le "$MAX_DIFF_BYTES" ]; then
-                  DIFF_MODE="compact unified diff (-U3), complete"
-                else
-                  DIFF_MODE="compact unified diff (-U3), TRUNCATED from ${DIFF_SIZE} to ${MAX_DIFF_BYTES} bytes"
-                fi
-              fi
-
-              {
-                printf '<commit_metadata>\nCommit: %s\nTitle: %s\n\nCommit message:\n%s\n</commit_metadata>\n\n' \
-                  "$SHA" "$(printf '%s' "$TITLE" | escape_tags)" "$(printf '%s' "$BODY" | escape_tags)"
-                printf '<diff_stat>\n%s\n</diff_stat>\n\n' "$(printf '%s' "$DIFF_STAT" | escape_tags)"
-                printf '<diff mode="%s">\n' "$DIFF_MODE"
-                (set +o pipefail; head -c "$MAX_DIFF_BYTES" "$DIFF_FILE" | escape_tags)
-                printf '\n</diff>\n'
-              } > "$USER_FILE"
-              rm -f "$DIFF_FILE"
-
-              REVIEW_OK=false
-              if [ "$AI_PROVIDER" != "dual" ]; then
-                if [ "$AI_PROVIDER" = "deepseek" ]; then
-                  EFFECTIVE_MODEL="${AI_MODEL:-$DEEPSEEK_DEFAULT_MODEL}"
-                else
-                  EFFECTIVE_MODEL="${AI_MODEL:-$GEMINI_DEFAULT_MODEL}"
-                fi
-                echo "Running ${AI_PROVIDER} (${EFFECTIVE_MODEL}, max ${MAX_ROUNDS} rounds) agentic review for $SHORT_SHA..."
-                if run_reviewer "$AI_PROVIDER" "$EFFECTIVE_MODEL" audit "$MAX_ROUNDS" 330 420 \
-                  "$USER_FILE" "$REVIEW_MD" "$STATS_MD" "$META_JSON" "" ""; then
-                  REVIEW_OK=true
-                fi
-              else
-                echo "Running blind dual cross-audit (deepseek + gemini, synthesizer=${AI_SYNTHESIZER}, max ${MAX_ROUNDS} audit / ${SYNTH_MAX_ROUNDS} synth rounds) for $SHORT_SHA..."
-                DRAFT_DS="${TMP_DIR}/draft-ds-${SHORT_SHA}.md"
-                USAGE_DS="${TMP_DIR}/usage-ds-${SHORT_SHA}.json"
-                DRAFT_GM="${TMP_DIR}/draft-gm-${SHORT_SHA}.md"
-                USAGE_GM="${TMP_DIR}/usage-gm-${SHORT_SHA}.json"
-                SYNTH_USER="${TMP_DIR}/synth-user-${SHORT_SHA}.txt"
-                DRAFT_SYNTH="${TMP_DIR}/draft-synth-${SHORT_SHA}.md"
-                USAGE_SYNTH="${TMP_DIR}/usage-synth-${SHORT_SHA}.json"
-
-                RC_DS=1
-                RC_GM=1
-                PID_DS=""
-                PID_GM=""
-
-                if [ -n "${DEEPSEEK_API_KEY:-}" ]; then
-                  run_reviewer deepseek "$DEEPSEEK_DEFAULT_MODEL" audit "$MAX_ROUNDS" 330 420 \
-                    "$USER_FILE" "$DRAFT_DS" "" "" "$USAGE_DS" draft &
-                  PID_DS=$!
-                else
-                  echo "Warning: DEEPSEEK_API_KEY not set in dual mode; skipping DeepSeek blind audit."
-                fi
-
-                if [ -n "${GEMINI_API_KEY:-}" ]; then
-                  run_reviewer gemini "$GEMINI_DEFAULT_MODEL" audit "$MAX_ROUNDS" 330 420 \
-                    "$USER_FILE" "$DRAFT_GM" "" "" "$USAGE_GM" draft &
-                  PID_GM=$!
-                else
-                  echo "Warning: GEMINI_API_KEY not set in dual mode; skipping Gemini blind audit."
-                fi
-
-                if [ -n "$PID_DS" ]; then
-                  RC_DS=0; wait "$PID_DS" || RC_DS=$?
-                fi
-                if [ -n "$PID_GM" ]; then
-                  RC_GM=0; wait "$PID_GM" || RC_GM=$?
-                fi
-
-                if [ "$RC_DS" -eq 0 ] && [ "$RC_GM" -eq 0 ]; then
-                  echo "Both blind audits succeeded; running ${AI_SYNTHESIZER} synthesizer..."
-                  if [ "$AI_SYNTHESIZER" = "deepseek" ]; then
-                    SYNTH_MODEL="$DEEPSEEK_DEFAULT_MODEL"
-                  else
-                    SYNTH_MODEL="$GEMINI_DEFAULT_MODEL"
-                  fi
-
-                  {
-                    cat "$USER_FILE"
-                    printf '\n<audit_a provider="deepseek" model="%s">\n' "$DEEPSEEK_DEFAULT_MODEL"
-                    (set +o pipefail; head -c "$MAX_DRAFT_BYTES" "$DRAFT_DS" | escape_tags)
-                    printf '\n</audit_a>\n\n<audit_b provider="gemini" model="%s">\n' "$GEMINI_DEFAULT_MODEL"
-                    (set +o pipefail; head -c "$MAX_DRAFT_BYTES" "$DRAFT_GM" | escape_tags)
-                    printf '\n</audit_b>\n'
-                  } > "$SYNTH_USER"
-
-                  if run_reviewer "$AI_SYNTHESIZER" "$SYNTH_MODEL" synthesize "$SYNTH_MAX_ROUNDS" 240 300 \
-                    "$SYNTH_USER" "$DRAFT_SYNTH" "" "" "$USAGE_SYNTH" draft; then
-                    if finalize_review "$DRAFT_SYNTH" "$REVIEW_MD" "$STATS_MD" "$META_JSON" "" \
-                      "Audit A:${USAGE_DS}" "Audit B:${USAGE_GM}" "Synthesis:${USAGE_SYNTH}"; then
-                      REVIEW_OK=true
-                    fi
-                  else
-                    echo "Warning: ${AI_SYNTHESIZER} synthesizer failed; falling back to surviving blind audit."
-                    if [ "$AI_SYNTHESIZER" = "gemini" ]; then
-                      FALLBACK_BANNER="> ⚠️ _Dual-audit fallback: \`gemini\` synthesizer failed; showing completed blind audit from \`deepseek\` (\`${DEEPSEEK_DEFAULT_MODEL}\`)._"
-                      if finalize_review "$DRAFT_DS" "$REVIEW_MD" "$STATS_MD" "$META_JSON" "$FALLBACK_BANNER" "Audit A:${USAGE_DS}"; then
-                        REVIEW_OK=true
-                      fi
-                    else
-                      FALLBACK_BANNER="> ⚠️ _Dual-audit fallback: \`deepseek\` synthesizer failed; showing completed blind audit from \`gemini\` (\`${GEMINI_DEFAULT_MODEL}\`)._"
-                      if finalize_review "$DRAFT_GM" "$REVIEW_MD" "$STATS_MD" "$META_JSON" "$FALLBACK_BANNER" "Audit B:${USAGE_GM}"; then
-                        REVIEW_OK=true
-                      fi
-                    fi
-                  fi
-                elif [ "$RC_DS" -eq 0 ]; then
-                  echo "Warning: Gemini blind audit unavailable/failed; falling back to DeepSeek single-model audit."
-                  FALLBACK_BANNER="> ⚠️ _Dual-audit fallback: \`gemini\` was unavailable; showing single-model audit from \`deepseek\` (\`${DEEPSEEK_DEFAULT_MODEL}\`)._"
-                  if finalize_review "$DRAFT_DS" "$REVIEW_MD" "$STATS_MD" "$META_JSON" "$FALLBACK_BANNER" "Audit A:${USAGE_DS}"; then
-                    REVIEW_OK=true
-                  fi
-                elif [ "$RC_GM" -eq 0 ]; then
-                  echo "Warning: DeepSeek blind audit unavailable/failed; falling back to Gemini single-model audit."
-                  FALLBACK_BANNER="> ⚠️ _Dual-audit fallback: \`deepseek\` was unavailable; showing single-model audit from \`gemini\` (\`${GEMINI_DEFAULT_MODEL}\`)._"
-                  if finalize_review "$DRAFT_GM" "$REVIEW_MD" "$STATS_MD" "$META_JSON" "$FALLBACK_BANNER" "Audit B:${USAGE_GM}"; then
-                    REVIEW_OK=true
-                  fi
-                fi
-
-                rm -f "$DRAFT_DS" "$USAGE_DS" "$DRAFT_GM" "$USAGE_GM" "$SYNTH_USER" "$DRAFT_SYNTH" "$USAGE_SYNTH"
-              fi
-
-              if [ "$REVIEW_OK" = true ]; then
-                if ! post_pr_comment "$PR_URL" "$REVIEW_MD"; then
-                  echo "Error: failed to post review comment on $PR_URL; closing unreviewed PR so next run retries."
-                  close_unreviewed_pr "$PR_URL" "$BASE_BRANCH"
-                  rm -f "$USER_FILE" "$REVIEW_MD" "$STATS_MD" "$META_JSON"
-                  exit 1
-                fi
-
-                TRIAGE_BADGE=""
-                if [ -f "$META_JSON" ] && jq -e '.help_wanted == true' "$META_JSON" >/dev/null 2>&1; then
-                  echo "Audit flagged help-wanted for $SHORT_SHA; labeling PR..."
-                  gh label create "help wanted" \
-                    --repo "$GITHUB_REPOSITORY" \
-                    --color "008672" \
-                    --description "AI audit flagged a bug, risk, or concrete follow-up fix" \
-                    2>/dev/null || true
-                  gh pr edit "$PR_URL" \
-                    --repo "$GITHUB_REPOSITORY" \
-                    --add-label "help wanted" || true
-                  TRIAGE_BADGE=" — 🏷️ \`help wanted\`"
-                fi
-
-                SAFE_TITLE=$(printf '%s' "$TITLE" | tr -d '[]\r\n')
-                {
-                  printf '### [%s](%s) (`%s`)%s\n\n' "$SAFE_TITLE" "$PR_URL" "$SHORT_SHA" "$TRIAGE_BADGE"
-                  cat "$STATS_MD"
-                  printf '\n\n'
-                } >> "$GITHUB_STEP_SUMMARY"
-              else
-                echo "Error: ${AI_PROVIDER} review failed or timed out for $SHORT_SHA; closing unreviewed PR so next run retries."
-                close_unreviewed_pr "$PR_URL" "$BASE_BRANCH"
-                rm -f "$USER_FILE" "$REVIEW_MD" "$STATS_MD" "$META_JSON"
-                exit 1
-              fi
-
-              rm -f "$USER_FILE" "$REVIEW_MD" "$STATS_MD" "$META_JSON"
-            else
-              echo "API key secret for provider '${AI_PROVIDER}' is not set; skipping automated review."
+            if ! attach_queue_label "$PR_URL" "$QUEUE_LABEL"; then
+              exit 1
             fi
 
+            SAFE_TITLE=$(printf '%s' "$TITLE" | tr -d '[]\r\n')
+            printf -- '- [%s](%s) (`%s`) — queued (`%s`)\n' "$SAFE_TITLE" "$PR_URL" "$SHORT_SHA" "$QUEUE_LABEL" >> "$GITHUB_STEP_SUMMARY"
+
             advance_tracker "$SHA"
-            COUNT=$((COUNT + 1))
+            CREATED_COUNT=$((CREATED_COUNT + 1))
           done
+
+      - name: Send ntfy wake-up signal
+        if: (success() || failure()) && steps.create_prs.outputs.created_count != '' && steps.create_prs.outputs.created_count != '0'
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL || vars.NTFY_URL }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || vars.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+        run: |
+          ntfy_url="${NTFY_URL:-}"
+          ntfy_topic="${NTFY_TOPIC:-}"
+          ntfy_token="${NTFY_TOKEN:-}"
+
+          if [ -z "$ntfy_url" ] || [ -z "$ntfy_topic" ]; then
+            echo "::warning::ntfy wake-up skipped (NTFY_URL or NTFY_TOPIC not configured)."
+            exit 0
+          fi
+
+          if [[ "$ntfy_url" == *'"'* || "$ntfy_url" == *'\'* || "$ntfy_url" =~ [[:space:][:cntrl:]] ]]; then
+            echo "::warning::ntfy wake-up skipped (NTFY_URL contains invalid characters)."
+            exit 0
+          fi
+
+          while [[ "$ntfy_url" == */ ]]; do
+            ntfy_url="${ntfy_url%/}"
+          done
+
+          url_re='^https://[^/]+(/.*)?$'
+          if [[ ! "$ntfy_url" =~ $url_re ]]; then
+            echo "::warning::ntfy wake-up skipped (NTFY_URL must be a valid https:// URL)."
+            exit 0
+          fi
+
+          ntfy_topic="${ntfy_topic#/}"
+          ntfy_topic="${ntfy_topic%/}"
+          topic_re='^[A-Za-z0-9._~-]+$'
+          if [[ ! "$ntfy_topic" =~ $topic_re ]]; then
+            echo "::warning::ntfy wake-up skipped (NTFY_TOPIC contains invalid characters or is empty)."
+            exit 0
+          fi
+
+          if [ -n "$ntfy_token" ]; then
+            if [[ "$ntfy_token" == *'"'* || "$ntfy_token" == *'\'* || "$ntfy_token" =~ [[:cntrl:]] ]]; then
+              echo "::warning::ntfy wake-up skipped (NTFY_TOKEN contains invalid characters)."
+              exit 0
+            fi
+          fi
+
+          target_url="${ntfy_url}/${ntfy_topic}"
+          curl_rc=0
+          http_code=$(
+            {
+              printf 'url = "%s"\n' "$target_url"
+              if [ -n "$ntfy_token" ]; then
+                printf 'header = "Authorization: Bearer %s"\n' "$ntfy_token"
+              fi
+            } | curl -s --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 15 \
+              -X POST -H "Content-Length: 0" \
+              -o /dev/null -w '%{http_code}' \
+              -K - 2>/dev/null
+          ) || curl_rc=$?
+          http_code="${http_code:-000}"
+
+          if [ "$curl_rc" -ne 0 ] || [[ ! "$http_code" =~ ^2[0-9]{2}$ ]]; then
+            echo "::warning::ntfy wake-up POST failed (exit=${curl_rc}, http=${http_code}); review PRs remain queued."
+            exit 0
+          fi
+          echo "Sent contentless ntfy wake-up signal (http=${http_code})."
