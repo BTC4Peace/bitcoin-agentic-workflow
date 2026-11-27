@@ -1,6 +1,6 @@
-**TODO**: pretty readme
-
 Experimental ground for AI reviewing Bitcoin Core merges
+
+-> [Repo of the reviewer](https://github.com/BTC4Peace/bitcoin-review-bot)
 
 **Current implementation:**
 
@@ -19,8 +19,6 @@ Moving the entire reviewing process off GitHub, on a computer/server/Pi, python-
 -> A GitHub action can be a basic reviewer bot with sheer prompting; even with a structural flow like [Ralph](https://github.com/willcl-ark/nix/tree/master/pkgs/ralph/agents)
 
 -> But moving into a persistent local box promotes the reviewer from a static code reviewer into an evidence-backed auditor that compiles, tests, mutates, and fuzzes merges
-
-On a separate public repo when ready to deploy
 
 **Goal:**
 
