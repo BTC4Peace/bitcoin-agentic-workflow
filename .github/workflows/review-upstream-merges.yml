@@ -1,12 +1,12 @@
 name: Create Review PRs for Bitcoin Core Merges
 
 on:
-  # TODO: Re-enable daily schedule (cron: '0 0 * * *') once manual testing is complete
+  schedule:
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
-      # TODO: Remove rewind_merges input once manual testing is complete
       rewind_merges:
-        description: 'TEMPORARY (testing): rewind upstream-tracker by N merge commits (0-5)'
+        description: 'Optional (manual dispatch): rewind upstream-tracker by N merge commits (0-5)'
         required: false
         default: '0'
         type: string
@@ -41,12 +41,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          # TODO: Remove REWIND_MERGES once manual testing is complete
           REWIND_MERGES: ${{ inputs.rewind_merges || '0' }}
           MAX_PRS_PER_RUN: 5
           QUEUE_LABEL: ${{ vars.QUEUE_LABEL || 'needs-audit' }}
         run: |
-          # TODO: Remove REWIND_MERGES handling once manual testing is complete
           if [[ ! "$REWIND_MERGES" =~ ^[0-5]$ ]]; then
             echo "Invalid REWIND_MERGES value (must be 0-5): $REWIND_MERGES"
             exit 1

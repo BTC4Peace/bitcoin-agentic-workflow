@@ -1,7 +1,8 @@
 name: Cleanup Review Branches
 
 on:
-  # TODO: Re-enable daily schedule (cron: '30 0 * * *') once manual testing is complete
+  schedule:
+    - cron: '15 0 * * *'
   workflow_dispatch:
 
 permissions:
