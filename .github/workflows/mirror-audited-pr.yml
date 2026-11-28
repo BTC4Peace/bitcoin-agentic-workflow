@@ -1,0 +1,309 @@
+name: Mirror Audited PR to Target Repository
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Staging PR number in this repository to mirror (must have the audited label)'
+        required: true
+        type: string
+      target_repo:
+        description: 'Target owner/repo (defaults to vars.MIRROR_TARGET_REPO or bitcoin-v/bitcoin)'
+        required: false
+        default: ''
+        type: string
+      target_base:
+        description: 'Target base branch (defaults to vars.MIRROR_TARGET_BASE or master)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: read
+  issues: write
+
+concurrency:
+  group: mirror-audited-pr
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        vars.MIRROR_ENABLED == 'true' &&
+        github.event.label.name == 'audited' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Resolve target repository and validate inputs
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          INPUT_TARGET_REPO: ${{ inputs.target_repo }}
+          VAR_TARGET_REPO: ${{ vars.MIRROR_TARGET_REPO }}
+          INPUT_TARGET_BASE: ${{ inputs.target_base }}
+          VAR_TARGET_BASE: ${{ vars.MIRROR_TARGET_BASE }}
+          APP_ID: ${{ vars.MIRROR_APP_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            PR_NUM="$INPUT_PR_NUMBER"
+          else
+            PR_NUM="$EVENT_PR_NUMBER"
+          fi
+          if [[ ! "$PR_NUM" =~ ^[0-9]+$ ]] || [ "$PR_NUM" -le 0 ]; then
+            echo "Error: invalid PR number '$PR_NUM'."
+            exit 1
+          fi
+
+          TARGET_REPO="${INPUT_TARGET_REPO:-${VAR_TARGET_REPO:-bitcoin-v/bitcoin}}"
+          if [[ ! "$TARGET_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Error: invalid target_repo '$TARGET_REPO'."
+            exit 1
+          fi
+
+          TARGET_BASE="${INPUT_TARGET_BASE:-${VAR_TARGET_BASE:-master}}"
+          if [[ ! "$TARGET_BASE" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$TARGET_BASE" == -* ]]; then
+            echo "Error: invalid target_base '$TARGET_BASE'."
+            exit 1
+          fi
+
+          if [ -z "$APP_ID" ]; then
+            echo "Error: repository variable MIRROR_APP_ID is not set."
+            exit 1
+          fi
+
+          TARGET_OWNER="${TARGET_REPO%%/*}"
+          TARGET_NAME="${TARGET_REPO#*/}"
+          {
+            echo "pr_number=${PR_NUM}"
+            echo "repo=${TARGET_REPO}"
+            echo "owner=${TARGET_OWNER}"
+            echo "name=${TARGET_NAME}"
+            echo "base=${TARGET_BASE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Mint GitHub App installation token for target repository
+        id: app_token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ vars.MIRROR_APP_ID }}
+          private-key: ${{ secrets.MIRROR_APP_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.name }}
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Checkout staging repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Cherry-pick audited merge and mirror PR to target repository
+        env:
+          SOURCE_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_OWNER: ${{ github.repository_owner }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          TARGET_REPO: ${{ steps.target.outputs.repo }}
+          TARGET_BASE: ${{ steps.target.outputs.base }}
+        run: |
+          set -euo pipefail
+
+          # 1. Load staging PR metadata and enforce safety guards
+          PR_JSON=$(GH_TOKEN="$SOURCE_GH_TOKEN" gh api "repos/${SOURCE_REPO}/pulls/${PR_NUMBER}")
+
+          HEAD_REPO_FULL=$(printf '%s\n' "$PR_JSON" | jq -r '.head.repo.full_name // empty')
+          if [ "$HEAD_REPO_FULL" != "$SOURCE_REPO" ]; then
+            echo "Refusing cross-repository PR #${PR_NUMBER} (head repo: '${HEAD_REPO_FULL}')."
+            exit 1
+          fi
+
+          HAS_AUDITED=$(printf '%s\n' "$PR_JSON" | jq -r '[.labels[].name] | index("audited") != null')
+          if [ "$HAS_AUDITED" != "true" ]; then
+            echo "PR #${PR_NUMBER} does not have the 'audited' label; skipping."
+            exit 0
+          fi
+
+          BASE_SHA=$(printf '%s\n' "$PR_JSON" | jq -r '.base.sha')
+          HEAD_SHA=$(printf '%s\n' "$PR_JSON" | jq -r '.head.sha')
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || [[ ! "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Error: invalid base/head SHA ('${BASE_SHA}' / '${HEAD_SHA}')."
+            exit 1
+          fi
+
+          SHORT_SHA="${HEAD_SHA:0:12}"
+          MIRROR_BRANCH="mirror/pr-${SHORT_SHA}"
+          PR_TITLE=$(printf '%s\n' "$PR_JSON" | jq -r '.title')
+          PR_BODY=$(printf '%s\n' "$PR_JSON" | jq -r '.body // ""')
+          STAGING_URL=$(printf '%s\n' "$PR_JSON" | jq -r '.html_url')
+
+          # 2. Idempotency check: skip if target repo already has a PR for this mirror branch
+          EXISTING_URL=$(GH_TOKEN="$TARGET_GH_TOKEN" gh api \
+            "repos/${TARGET_REPO}/pulls?state=all&head=${SOURCE_OWNER}:${MIRROR_BRANCH}&per_page=10" \
+            --jq '.[0].html_url // empty')
+          if [ -n "$EXISTING_URL" ]; then
+            echo "Mirrored PR already exists on ${TARGET_REPO}: ${EXISTING_URL}"
+            exit 0
+          fi
+
+          # 3. Extract the latest verified audit comment from the staging PR
+          AUDIT_COMMENT=$(GH_TOKEN="$SOURCE_GH_TOKEN" gh api --paginate \
+            "repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq '[.[]
+              | select(.author_association == "OWNER" or .author_association == "COLLABORATOR" or .user.type == "Bot")
+              | select((.body // "") | (contains("📊 Token Usage & Review Stats") or contains("Post-Merge Audit")))
+            ] | last | .body // empty')
+
+          # 4. Fetch target base branch and cherry-pick only this single merge onto it
+          git fetch origin "$BASE_SHA" "$HEAD_SHA"
+          git fetch "https://github.com/${TARGET_REPO}.git" "refs/heads/${TARGET_BASE}:refs/remotes/target/${TARGET_BASE}"
+
+          git config user.name "bitcoin-review-bot[bot]"
+          git config user.email "bitcoin-review-bot[bot]@users.noreply.github.com"
+
+          git checkout -B "$MIRROR_BRANCH" "refs/remotes/target/${TARGET_BASE}"
+
+          PARENTS=$(git rev-list --parents -n 1 "$HEAD_SHA")
+          PARENT_COUNT=$(printf '%s\n' "$PARENTS" | awk '{print NF - 1}')
+
+          CHERRY_STATUS="ok"
+          if [ "$PARENT_COUNT" -ge 2 ]; then
+            if ! git cherry-pick -m 1 "$HEAD_SHA"; then
+              if [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+                CHERRY_STATUS="empty"
+              else
+                CHERRY_STATUS="conflict"
+              fi
+            fi
+          else
+            if ! git cherry-pick "$HEAD_SHA"; then
+              if [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+                CHERRY_STATUS="empty"
+              else
+                CHERRY_STATUS="conflict"
+              fi
+            fi
+          fi
+
+          ensure_label() {
+            local tok="$1"
+            local repo="$2"
+            local label_json="$3"
+            local label_name=""
+            label_name=$(printf '%s\n' "$label_json" | jq -r '.name')
+            [ -n "$label_name" ] || return 1
+            local encoded=""
+            encoded=$(jq -rn --arg l "$label_name" '$l|@uri')
+            if GH_TOKEN="$tok" gh api "repos/${repo}/labels/${encoded}" >/dev/null 2>&1; then
+              return 0
+            fi
+            local err_out=""
+            if ! err_out=$(printf '%s\n' "$label_json" | GH_TOKEN="$tok" gh api --method POST "repos/${repo}/labels" --input - 2>&1 >/dev/null); then
+              if grep -qE '422|already_exists' <<< "$err_out"; then
+                return 0
+              fi
+              echo "Warning: could not create label '${label_name}' on ${repo}: ${err_out}"
+              return 1
+            fi
+          }
+
+          if [ "$CHERRY_STATUS" = "empty" ]; then
+            git cherry-pick --abort || true
+            echo "Changes from ${SHORT_SHA} are already present in ${TARGET_REPO}:${TARGET_BASE}; skipping."
+            echo "### Mirror Skipped (Already Present)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Staging PR: ${STAGING_URL}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- \`${SHORT_SHA}\` produced an empty cherry-pick on \`${TARGET_REPO}:${TARGET_BASE}\`." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "$CHERRY_STATUS" = "conflict" ]; then
+            git cherry-pick --abort || true
+            echo "Cherry-pick conflict applying ${SHORT_SHA} onto ${TARGET_REPO}:${TARGET_BASE}."
+
+            CONFLICT_LABEL=$(jq -nc '{name: "mirror-conflict", color: "d93f0b", description: "Cherry-pick conflict against target repository base branch"}')
+            ensure_label "$SOURCE_GH_TOKEN" "$SOURCE_REPO" "$CONFLICT_LABEL" || true
+            jq -nc '{labels: ["mirror-conflict"]}' | GH_TOKEN="$SOURCE_GH_TOKEN" gh api --method POST "repos/${SOURCE_REPO}/issues/${PR_NUMBER}/labels" --input - >/dev/null || true
+
+            NOTE_BODY=$(printf '⚠️ Auto-mirror to `%s:%s` skipped: `git cherry-pick` of `%s` hit a merge conflict (likely depends on an earlier unmerged upstream PR). Manual rebase needed.' \
+              "$TARGET_REPO" "$TARGET_BASE" "$SHORT_SHA")
+            jq -nc --arg body "$NOTE_BODY" '{body: $body}' | GH_TOKEN="$SOURCE_GH_TOKEN" gh api --method POST "repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments" --input - >/dev/null || true
+
+            echo "### Mirror Skipped (Conflict)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Staging PR: ${STAGING_URL}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Target: \`${TARGET_REPO}:${TARGET_BASE}\` (cherry-pick conflict on \`${SHORT_SHA}\`)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # 5. Push mirror branch to this fork (untouched by cleanup-review-branches.yml)
+          git push --force origin "HEAD:refs/heads/${MIRROR_BRANCH}"
+
+          # 6. Open cross-repo PR on target repo via GitHub App installation token
+          MIRROR_BODY=$(printf '%s\n\n---\n_Mirrored from audited staging PR: %s_' "$PR_BODY" "$STAGING_URL")
+          if [ "${#MIRROR_BODY}" -gt 65000 ]; then
+            MIRROR_BODY="${MIRROR_BODY:0:64950}"$'\n\n... [body truncated]'
+          fi
+
+          CREATE_PAYLOAD=$(jq -nc \
+            --arg title "$PR_TITLE" \
+            --arg head "${SOURCE_OWNER}:${MIRROR_BRANCH}" \
+            --arg base "$TARGET_BASE" \
+            --arg body "$MIRROR_BODY" \
+            '{title: $title, head: $head, base: $base, body: $body, maintainer_can_modify: false}')
+
+          CREATED_JSON=$(printf '%s\n' "$CREATE_PAYLOAD" | GH_TOKEN="$TARGET_GH_TOKEN" gh api --method POST "repos/${TARGET_REPO}/pulls" --input -)
+          MIRROR_PR_NUM=$(printf '%s\n' "$CREATED_JSON" | jq -r '.number')
+          MIRROR_PR_URL=$(printf '%s\n' "$CREATED_JSON" | jq -r '.html_url')
+          echo "Created mirrored PR: ${MIRROR_PR_URL}"
+
+          # 7. Post the AI audit comment on the mirrored PR
+          if [ -n "$AUDIT_COMMENT" ]; then
+            jq -nc --arg body "$AUDIT_COMMENT" '{body: $body}' \
+              | GH_TOKEN="$TARGET_GH_TOKEN" gh api --method POST "repos/${TARGET_REPO}/issues/${MIRROR_PR_NUM}/comments" --input - >/dev/null
+            echo "Posted audit comment to ${MIRROR_PR_URL}."
+          else
+            echo "Warning: no matching audit comment found on staging PR #${PR_NUMBER}."
+          fi
+
+          # 8. Sync labels (excluding staging-only queue/mirror labels)
+          LABELS_JSON=$(printf '%s\n' "$PR_JSON" | jq -c '[.labels[]?
+            | select((.name // "") | (type == "string") and (length > 0))
+            | select((.name | ascii_downcase) != "needs-audit")
+            | select((.name | ascii_downcase) != "mirror-conflict")
+            | select((.name | ascii_downcase) != "mirrored")
+            | {
+                name: .name,
+                color: (if ((.color // "") | test("^[0-9a-fA-F]{6}$")) then .color else "ededed" end),
+                description: ((.description // "") | tostring | .[0:100])
+              }]')
+
+          LABEL_COUNT=$(printf '%s\n' "$LABELS_JSON" | jq -r 'length')
+          if [ "$LABEL_COUNT" -gt 0 ]; then
+            while IFS= read -r LABEL_OBJ; do
+              [ -n "$LABEL_OBJ" ] || continue
+              ensure_label "$TARGET_GH_TOKEN" "$TARGET_REPO" "$LABEL_OBJ" || true
+            done < <(printf '%s\n' "$LABELS_JSON" | jq -c '.[]')
+
+            LABEL_NAMES_JSON=$(printf '%s\n' "$LABELS_JSON" | jq -c '{labels: [.[].name]}')
+            printf '%s\n' "$LABEL_NAMES_JSON" \
+              | GH_TOKEN="$TARGET_GH_TOKEN" gh api --method POST "repos/${TARGET_REPO}/issues/${MIRROR_PR_NUM}/labels" --input - >/dev/null || true
+          fi
+
+          # 9. Mark staging PR as mirrored
+          MIRRORED_LABEL=$(jq -nc '{name: "mirrored", color: "0e8a16", description: "Audited PR mirrored to target repository"}')
+          ensure_label "$SOURCE_GH_TOKEN" "$SOURCE_REPO" "$MIRRORED_LABEL" || true
+          jq -nc '{labels: ["mirrored"]}' | GH_TOKEN="$SOURCE_GH_TOKEN" gh api --method POST "repos/${SOURCE_REPO}/issues/${PR_NUMBER}/labels" --input - >/dev/null || true
+
+          echo "### Audited PR Mirrored" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Staging PR: ${STAGING_URL}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Mirrored PR: ${MIRROR_PR_URL} (\`${MIRROR_BRANCH}\` → \`${TARGET_REPO}:${TARGET_BASE}\`)" >> "$GITHUB_STEP_SUMMARY"
